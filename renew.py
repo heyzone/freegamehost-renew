@@ -1,15 +1,13 @@
 import os
-import json
 import time
 import requests
+from bs4 import BeautifulSoup
 from seleniumbase import SB
 
 # ── 环境变量 ────────────────────────────────────────────────
-# FGH_ACCOUNT 格式：多账号用换行或分号分隔
-#   每条格式：email:password:server_id  或  email:password:server_id1,server_id2
 RAW_ACCOUNT = os.environ.get("FGH_ACCOUNT", "")
 GOST_PROXY  = os.environ.get("GOST_PROXY", "")
-TG_BOT      = os.environ.get("TG_BOT", "")   # 格式：bot_token:chat_id
+TG_BOT      = os.environ.get("TG_BOT", "")
 
 BASE_URL  = "https://panel.freegamehost.xyz"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -48,6 +46,61 @@ def parse_accounts():
         server_ids = [s.strip() for s in parts[2].split(",") if s.strip()]
         accounts.append({"email": email, "password": password, "server_ids": server_ids})
     return accounts
+
+# ── requests 登录（绕过 reCAPTCHA）───────────────────────────
+def login_with_requests(email: str, password: str, proxy_str: str):
+    session = requests.Session()
+    proxies = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
+
+    # 1. 获取登录页拿 csrf token
+    print("🔑 获取登录页 CSRF Token...")
+    r = session.get(LOGIN_URL, proxies=proxies, timeout=15)
+    soup = BeautifulSoup(r.text, "html.parser")
+    csrf_meta = soup.find("meta", {"name": "csrf-token"})
+    if not csrf_meta:
+        raise RuntimeError("❌ 找不到 CSRF Token，页面结构可能已变化")
+    csrf = csrf_meta["content"]
+    print(f"✅ CSRF Token 获取成功：{csrf[:20]}...")
+
+    # 2. 提交登录表单
+    print("📤 提交登录请求...")
+    payload = {
+        "_token": csrf,
+        "user":   email,
+        "password": password,
+    }
+    headers = {
+        "Referer":      LOGIN_URL,
+        "X-CSRF-TOKEN": csrf,
+        "User-Agent":   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    r2 = session.post(
+        LOGIN_URL, data=payload, headers=headers,
+        proxies=proxies, timeout=15, allow_redirects=True
+    )
+    print(f"🔁 登录响应URL：{r2.url}")
+    print(f"🔁 登录响应状态码：{r2.status_code}")
+
+    if "login" in r2.url.lower():
+        # 尝试打印错误提示
+        soup2 = BeautifulSoup(r2.text, "html.parser")
+        err = soup2.find(class_=lambda c: c and "error" in c.lower())
+        raise RuntimeError(f"❌ 登录失败：{err.get_text(strip=True) if err else '仍在登录页'}")
+
+    print(f"✅ 登录成功！当前URL：{r2.url}")
+    return session
+
+# ── 获取 cookies 注入浏览器 ──────────────────────────────────
+def inject_cookies(sb, session: requests.Session):
+    print("🍪 注入登录 Cookie 到浏览器...")
+    sb.open(BASE_URL)
+    for cookie in session.cookies:
+        sb.execute_script(
+            f"document.cookie = '{cookie.name}={cookie.value}; path=/; domain={cookie.domain}';"
+        )
+    sb.sleep(1)
+    print("✅ Cookie 注入完成")
 
 # ── 等待 Turnstile Token ─────────────────────────────────────
 def wait_for_turnstile(sb, timeout=60):
@@ -149,7 +202,6 @@ def renew_server(sb, server_id: str) -> dict:
                 continue
 
         sb.save_screenshot(f"renew_{server_id}.png")
-
         result["success"]   = True
         result["remaining"] = remaining
         print(f"🎉 续期成功！剩余时间：{remaining}")
@@ -170,74 +222,43 @@ def process_account(account: dict):
     password   = account["password"]
     server_ids = account["server_ids"]
 
-    # 代理设置
     proxy_str = "http://127.0.0.1:8080" if GOST_PROXY else None
 
-    results  = []
+    # 验证出口 IP
+    print("🌐 验证出口IP...")
+    try:
+        proxies  = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
+        ip_data  = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10).json()
+        raw_ip   = ip_data.get("ip", "unknown")
+        ip_masked = ".".join(raw_ip.split(".")[:3]) + ".xx"
+        print(f'✅ 出口IP确认：{{"ip":"{ip_masked}"}} Pretty-print')
+    except Exception as e:
+        print(f"⚠️ 出口IP验证失败: {e}，继续...")
+
+    # requests 登录（绕过 reCAPTCHA）
+    session = login_with_requests(email, password, proxy_str)
+
+    # 启动浏览器并注入 cookie
     sb_kwargs = dict(uc=True, headless=True)
     if proxy_str:
         sb_kwargs["proxy"] = proxy_str
 
+    results = []
     with SB(**sb_kwargs) as sb:
         print("🔧 启动浏览器...")
         print("🚀 浏览器就绪！")
 
-        # 验证出口 IP（用 requests 走代理，不依赖浏览器 JS）
-        print("🌐 验证出口IP...")
-        try:
-            proxies  = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
-            print(f"🔧 代理配置：{proxies}")
-            ip_data  = requests.get(
-                "https://api.ipify.org?format=json", proxies=proxies, timeout=10
-            ).json()
-            raw_ip    = ip_data.get("ip", "unknown")
-            ip_parts  = raw_ip.split(".")
-            ip_masked = ".".join(ip_parts[:3]) + ".xx"
-            print(f'✅ 出口IP确认：{{"ip":"{ip_masked}"}} Pretty-print')
-        except Exception as e:
-            print(f"⚠️ 出口IP验证失败: {e}，继续...")
+        inject_cookies(sb, session)
 
-
-        # 登录
-        print("🔑 打开登录页面...")
-        sb.open(LOGIN_URL)
-        sb.sleep(5)  # 等待页面及 JS 渲染完成
-        sb.save_screenshot("login_page.png")
-
-        # 打印源码前 3000 字符，排查选择器（成功后可删除）
-        html = sb.get_page_source()
-        print("📄 页面源码片段：")
-        print(html[:3000])
-
-        print("✏️ 填写账号密码...")
-        sb.wait_for_element_present(
-            "input[type='email'], input[name='email'], input[type='text']", timeout=20
-        )
-        sb.type("input[type='email'], input[name='email'], input[type='text']", email)
-        sb.type("input[type='password'], input[name='password']", password)
-
-        # 登录页 Turnstile
-        print("📡 开始监控 Turnstile Token（登录页）...")
-        time.sleep(2)
-        click_turnstile(sb)
-
-        print("📤 提交登录请求...")
-        try:
-            sb.click("button[type='submit']", timeout=10)
-        except Exception:
-            sb.press_keys("input[type='password']", "\n")
-
-        print("⏳ 等待登录跳转...")
-        sb.sleep(5)
+        # 验证 cookie 是否有效（访问面板首页）
+        sb.open(BASE_URL)
+        sb.sleep(3)
         current = sb.get_current_url()
-
         if "login" in current.lower():
-            sb.save_screenshot("login_failed.png")
-            raise RuntimeError(f"登录失败，仍在登录页：{current}")
+            sb.save_screenshot("cookie_inject_failed.png")
+            raise RuntimeError("Cookie 注入后仍跳转到登录页，登录态无效")
+        print(f"✅ 会话有效，当前页面：{current}")
 
-        print(f"✅ 登录成功！当前页面：{current}")
-
-        # 逐个续期
         for sid in server_ids:
             r = renew_server(sb, sid)
             results.append(r)
