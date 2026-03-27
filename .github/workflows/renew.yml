@@ -43,8 +43,9 @@ jobs:
 
       - name: 🐍 安装 Python 依赖
         run: |
-          pip install seleniumbase
+          pip install seleniumbase beautifulsoup4
           seleniumbase install chromedriver
+
 
       - name: 🚀 运行脚本
         env:
