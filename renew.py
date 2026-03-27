@@ -199,27 +199,30 @@ def process_account(account: dict):
         print("🚀 浏览器就绪！")
 
         # 验证出口 IP
+        # 验证出口 IP
         print("🌐 验证出口IP...")
         try:
-            ip_info = sb.execute_script("""
-                return await fetch('https://api.ipify.org?format=json').then(r => r.json()).then(d => JSON.stringify(d));
-            """)
-            ip_masked = ""
-            if ip_info:
-                ip_data = json.loads(ip_info)
-                raw_ip  = ip_data.get("ip", "unknown")
-                parts   = raw_ip.split(".")
-                ip_masked = ".".join(parts[:3]) + ".xx"
+            proxies = {"http": "http://127.0.0.1:8080", "https": "http://127.0.0.1:8080"} if GOST_PROXY else {}
+            ip_data = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10).json()
+            raw_ip  = ip_data.get("ip", "unknown")
+            parts   = raw_ip.split(".")
+            ip_masked = ".".join(parts[:3]) + ".xx"
             print(f'✅ 出口IP确认：{{"ip":"{ip_masked}"}} Pretty-print')
-        except Exception:
-            print("⚠️ 出口IP验证失败，继续...")
+        except Exception as e:
+            print(f"⚠️ 出口IP验证失败: {e}，继续...")
+
 
         # 登录
         print("🔑 打开登录页面...")
         sb.open(LOGIN_URL)
-        sb.wait_for_element_present("input[type='email'], input[name='email']", timeout=20)
+        sb.sleep(5)
+        sb.save_screenshot("login_page.png")
+        html = sb.get_page_source()
+        print("📄 页面源码片段：")
+        print(html[:3000])
 
         print("✏️ 填写账号密码...")
+        sb.wait_for_element_present("input[type='email'], input[name='email']", timeout=20)
         sb.type("input[type='email'], input[name='email']", email)
         sb.type("input[type='password'], input[name='password']", password)
 
