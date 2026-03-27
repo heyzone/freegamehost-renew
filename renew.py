@@ -11,20 +11,18 @@ RAW_ACCOUNT = os.environ.get("FGH_ACCOUNT", "")
 GOST_PROXY  = os.environ.get("GOST_PROXY", "")
 TG_BOT      = os.environ.get("TG_BOT", "")   # 格式：bot_token:chat_id
 
-BASE_URL    = "https://panel.freegamehost.xyz"
-LOGIN_URL   = f"{BASE_URL}/auth/login"
+BASE_URL  = "https://panel.freegamehost.xyz"
+LOGIN_URL = f"{BASE_URL}/auth/login"
 
 # ── Telegram 推送 ────────────────────────────────────────────
 def tg_send(text: str):
     if not TG_BOT:
         return
     try:
-        token, chat_id = TG_BOT.split(":", 1)
-        # chat_id 可能含负号（群组），重新拼回
-        parts = TG_BOT.split(":")
+        parts   = TG_BOT.split(":")
         token   = parts[0] + ":" + parts[1]
         chat_id = parts[2]
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        url  = f"https://api.telegram.org/bot{token}/sendMessage"
         resp = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
         if resp.ok:
             print("📨 TG推送成功")
@@ -35,11 +33,6 @@ def tg_send(text: str):
 
 # ── 解析账号列表 ─────────────────────────────────────────────
 def parse_accounts():
-    """
-    支持格式（每行一个账号）：
-        email:password:server_id
-        email:password:server_id1,server_id2
-    """
     accounts = []
     lines = RAW_ACCOUNT.replace(";", "\n").splitlines()
     for line in lines:
@@ -78,14 +71,12 @@ def wait_for_turnstile(sb, timeout=60):
 def click_turnstile(sb):
     print("📐 坐标计算完成")
     try:
-        # 尝试直接点击 iframe 内的 checkbox
         sb.switch_to_frame("iframe[src*='challenges.cloudflare.com']")
         sb.click("input[type='checkbox']", timeout=10)
         sb.switch_to_default_content()
     except Exception:
         try:
             sb.switch_to_default_content()
-            # fallback：用 JS 定位 iframe 坐标后模拟点击
             sb.execute_script("""
                 const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
                 if (iframe) {
@@ -101,9 +92,6 @@ def click_turnstile(sb):
 
 # ── 单服务器续期 ─────────────────────────────────────────────
 def renew_server(sb, server_id: str) -> dict:
-    """
-    返回 {"server_id": ..., "name": ..., "success": bool, "remaining": str, "error": str}
-    """
     result = {"server_id": server_id, "name": server_id, "success": False, "remaining": "", "error": ""}
     server_url = f"{BASE_URL}/server/{server_id}"
     try:
@@ -113,7 +101,6 @@ def renew_server(sb, server_id: str) -> dict:
         sb.wait_for_element_present("body", timeout=20)
         print("✅ 服务器页面加载完成")
 
-        # 读取服务器名称
         print("🔍 读取服务器名称...")
         try:
             name = sb.get_text("h1, .server-name, [class*='server-name'], [class*='title']", timeout=5)
@@ -125,7 +112,6 @@ def renew_server(sb, server_id: str) -> dict:
 
         print("🔄 开始执行续期流程...")
 
-        # 点击 +8 Hours 续期按钮
         renew_btn_selectors = [
             "button:contains('+8 Hours')",
             "button:contains('Renew')",
@@ -145,17 +131,14 @@ def renew_server(sb, server_id: str) -> dict:
         if not clicked:
             raise RuntimeError("找不到续期按钮")
 
-        # Turnstile 验证
         print("⏳ 等待 Turnstile 验证组件...")
         time.sleep(2)
         click_turnstile(sb)
         wait_for_turnstile(sb, timeout=60)
 
-        # 等待续期完成
         print("⏳ 等待续期完成...")
         time.sleep(3)
 
-        # 读取剩余时间（示例选择器，按实际页面调整）
         remaining = ""
         for sel in ["[class*='remaining']", "[class*='time-left']", "[class*='expire']", ".remaining-time"]:
             try:
@@ -165,7 +148,6 @@ def renew_server(sb, server_id: str) -> dict:
             except Exception:
                 continue
 
-        # 截图留证
         sb.save_screenshot(f"renew_{server_id}.png")
 
         result["success"]   = True
@@ -188,42 +170,48 @@ def process_account(account: dict):
     password   = account["password"]
     server_ids = account["server_ids"]
 
-    proxy_args = {}
-    if GOST_PROXY:
-        proxy_args["proxy"] = "http://127.0.0.1:8080"
+    # 代理设置
+    proxy_str = "http://127.0.0.1:8080" if GOST_PROXY else None
 
-    results = []
+    results  = []
+    sb_kwargs = dict(uc=True, headless=True)
+    if proxy_str:
+        sb_kwargs["proxy"] = proxy_str
 
-    with SB(uc=True, headless=True, **proxy_args) as sb:
+    with SB(**sb_kwargs) as sb:
         print("🔧 启动浏览器...")
         print("🚀 浏览器就绪！")
 
-        # 验证出口 IP
-        # 验证出口 IP
+        # 验证出口 IP（用 requests 走代理，不依赖浏览器 JS）
         print("🌐 验证出口IP...")
         try:
-            proxies = {"http": "http://127.0.0.1:8080", "https": "http://127.0.0.1:8080"} if GOST_PROXY else {}
-            ip_data = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10).json()
-            raw_ip  = ip_data.get("ip", "unknown")
-            parts   = raw_ip.split(".")
-            ip_masked = ".".join(parts[:3]) + ".xx"
+            proxies  = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
+            ip_data  = requests.get(
+                "https://api.ipify.org?format=json", proxies=proxies, timeout=10
+            ).json()
+            raw_ip    = ip_data.get("ip", "unknown")
+            ip_parts  = raw_ip.split(".")
+            ip_masked = ".".join(ip_parts[:3]) + ".xx"
             print(f'✅ 出口IP确认：{{"ip":"{ip_masked}"}} Pretty-print')
         except Exception as e:
             print(f"⚠️ 出口IP验证失败: {e}，继续...")
 
-
         # 登录
         print("🔑 打开登录页面...")
         sb.open(LOGIN_URL)
-        sb.sleep(5)
+        sb.sleep(5)  # 等待页面及 JS 渲染完成
         sb.save_screenshot("login_page.png")
+
+        # 打印源码前 3000 字符，排查选择器（成功后可删除）
         html = sb.get_page_source()
         print("📄 页面源码片段：")
         print(html[:3000])
 
         print("✏️ 填写账号密码...")
-        sb.wait_for_element_present("input[type='email'], input[name='email']", timeout=20)
-        sb.type("input[type='email'], input[name='email']", email)
+        sb.wait_for_element_present(
+            "input[type='email'], input[name='email'], input[type='text']", timeout=20
+        )
+        sb.type("input[type='email'], input[name='email'], input[type='text']", email)
         sb.type("input[type='password'], input[name='password']", password)
 
         # 登录页 Turnstile
@@ -238,10 +226,11 @@ def process_account(account: dict):
             sb.press_keys("input[type='password']", "\n")
 
         print("⏳ 等待登录跳转...")
-        sb.wait_for_url_to_contain("/", timeout=30)
+        sb.sleep(5)
         current = sb.get_current_url()
 
         if "login" in current.lower():
+            sb.save_screenshot("login_failed.png")
             raise RuntimeError(f"登录失败，仍在登录页：{current}")
 
         print(f"✅ 登录成功！当前页面：{current}")
@@ -291,7 +280,6 @@ def main():
                 "error": str(e),
             })
 
-    # 汇总推送
     msg = build_tg_message(all_results)
     tg_send(msg)
 
