@@ -186,6 +186,7 @@ def process_account(account: dict):
         print("🌐 验证出口IP...")
         try:
             proxies  = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
+            print(f"🔧 代理配置：{proxies}")
             ip_data  = requests.get(
                 "https://api.ipify.org?format=json", proxies=proxies, timeout=10
             ).json()
@@ -195,6 +196,7 @@ def process_account(account: dict):
             print(f'✅ 出口IP确认：{{"ip":"{ip_masked}"}} Pretty-print')
         except Exception as e:
             print(f"⚠️ 出口IP验证失败: {e}，继续...")
+
 
         # 登录
         print("🔑 打开登录页面...")
