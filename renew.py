@@ -36,7 +36,6 @@ def parse_accounts():
         line = line.strip()
         if not line:
             continue
-        # 最多切2刀，密码里有冒号也安全
         parts = line.split(":", 2)
         if len(parts) < 3:
             print(f"⚠️ 账号格式错误，跳过：{line}")
@@ -51,24 +50,22 @@ def parse_accounts():
         print(f"✅ 解析账号：{email}，服务器：{server_ids}")
     return accounts
 
-# ── 等待 Turnstile / reCAPTCHA Token（通用轮询）─────────────
-def wait_for_captcha_token(sb, timeout=90):
-    print("📡 开始监控验证 Token...")
+# ── 等待 Turnstile Token（续期页用）─────────────────────────
+def wait_for_turnstile(sb, timeout=90):
+    print("📡 开始监控 Turnstile Token...")
     print("⏳ 等待验证组件加载...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 优先检查 Turnstile
         try:
             token = sb.execute_script(
                 "return document.querySelector('[name=\"cf-turnstile-response\"]')?.value || '';"
             )
             if token and len(token) > 20:
                 print(f"✅ Cloudflare Turnstile 验证通过！token：{token[:60]}...")
-                return "turnstile", token
+                return token
         except Exception:
             pass
 
-        # 遍历 iframe 查 Turnstile
         try:
             iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
             for i in range(iframe_count):
@@ -83,32 +80,15 @@ def wait_for_captcha_token(sb, timeout=90):
                     """)
                     if token and len(token) > 20:
                         print(f"✅ Cloudflare Turnstile 验证通过（iframe[{i}]）！token：{token[:60]}...")
-                        return "turnstile", token
+                        return token
                 except Exception:
                     pass
         except Exception:
             pass
 
-        # 检查 reCAPTCHA
-        try:
-            token = sb.execute_script("""
-                var els = document.querySelectorAll(
-                    '[id*="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
-                );
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].value && els[i].value.length > 20) return els[i].value;
-                }
-                return '';
-            """)
-            if token and len(token) > 20:
-                print(f"✅ reCAPTCHA 验证通过！token：{token[:60]}...")
-                return "recaptcha", token
-        except Exception:
-            pass
-
         time.sleep(1)
 
-    raise TimeoutError(f"❌ 验证 Token 等待超时（{timeout}s）")
+    raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
 # ── 点击 Turnstile iframe 中心 ───────────────────────────────
 def click_turnstile(sb):
@@ -135,6 +115,23 @@ def click_turnstile(sb):
     except Exception as e:
         print(f"⚠️ Turnstile 点击异常（依赖自动验证）: {e}")
 
+# ── 点击 LOGIN 按钮 ──────────────────────────────────────────
+def click_login_button(sb):
+    try:
+        sb.click(
+            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
+            timeout=10, by="xpath"
+        )
+        return
+    except Exception:
+        pass
+    try:
+        sb.click("button[type='submit']", timeout=5)
+        return
+    except Exception:
+        pass
+    sb.execute_script("document.querySelector('button').click();")
+
 # ── 浏览器登录 ───────────────────────────────────────────────
 def browser_login(sb, email: str, password: str):
     print("🔑 打开登录页面...")
@@ -145,7 +142,6 @@ def browser_login(sb, email: str, password: str):
     print("✏️ 填写账号密码...")
     try:
         sb.wait_for_element_present("input", timeout=15)
-        # Pterodactyl 是 React 框架，用 nativeInputValueSetter 触发状态更新
         email_js    = email.replace("\\", "\\\\").replace("'", "\\'")
         password_js = password.replace("\\", "\\\\").replace("'", "\\'")
         sb.execute_script(f"""
@@ -158,45 +154,30 @@ def browser_login(sb, email: str, password: str):
             setter.call(inputs[1], '{password_js}');
             inputs[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
         """)
-        sb.sleep(0.5)
+        sb.sleep(1)
+        print("✅ 账号密码填写完成")
     except Exception as e:
         sb.save_screenshot("input_error.png")
         raise RuntimeError(f"填写表单失败: {e}")
 
     sb.save_screenshot("before_submit.png")
 
-    # 检查是否有验证（Turnstile 或 reCAPTCHA）
+    # 检查是否有 Turnstile（CF盾）
     has_turnstile = sb.execute_script(
         "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
     )
-    has_recaptcha = sb.execute_script(
-        "return !!document.querySelector('iframe[src*=\"recaptcha\"]') || "
-        "!!document.querySelector('.g-recaptcha') || "
-        "!!document.getElementById('g-recaptcha-response');"
-    )
 
     if has_turnstile:
+        print("🛡️ 检测到 Turnstile，处理验证...")
         print("📡 开始监控 Turnstile Token（登录页）...")
         click_turnstile(sb)
-        wait_for_captcha_token(sb, timeout=90)
-    elif has_recaptcha:
-        print("📡 检测到 reCAPTCHA，等待自动通过...")
-        wait_for_captcha_token(sb, timeout=120)
+        wait_for_turnstile(sb, timeout=90)
+        print("📤 提交登录请求...")
+        click_login_button(sb)
     else:
-        print("ℹ️ 未检测到验证组件，直接提交")
-
-    # 提交登录
-    print("📤 提交登录请求...")
-    try:
-        sb.click(
-            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
-            timeout=10, by="xpath"
-        )
-    except Exception:
-        try:
-            sb.click("button[type='submit']", timeout=5)
-        except Exception:
-            sb.execute_script("document.querySelector('button').click();")
+        # 无 Turnstile，直接提交，让 reCAPTCHA 走隐式验证
+        print("📤 提交登录请求（无 Turnstile，直接提交）...")
+        click_login_button(sb)
 
     print("⏳ 等待登录跳转...")
     sb.sleep(8)
@@ -204,6 +185,14 @@ def browser_login(sb, email: str, password: str):
 
     current = sb.get_current_url()
     print(f"🔁 登录后URL：{current}")
+
+    # 如果还在登录页，等多一轮再判断（reCAPTCHA 隐式延迟）
+    if "login" in current.lower():
+        print("⏳ 仍在登录页，再等 10s...")
+        sb.sleep(10)
+        sb.save_screenshot("after_login2.png")
+        current = sb.get_current_url()
+        print(f"🔁 二次确认URL：{current}")
 
     if "login" in current.lower():
         sb.save_screenshot("login_failed.png")
@@ -223,7 +212,6 @@ def renew_server(sb, server_id: str) -> dict:
         sb.sleep(3)
         print("✅ 服务器页面加载完成")
 
-        # 读取服务器名称
         print("🔍 读取服务器名称...")
         name = server_id
         for sel in ["h1", ".server-name", "[class*='server-name']", "[class*='title']"]:
@@ -240,11 +228,8 @@ def renew_server(sb, server_id: str) -> dict:
         print("🔄 开始执行续期流程...")
         sb.save_screenshot(f"before_renew_{server_id}.png")
 
-        # 先启动 Turnstile 监控（后台轮询），再点击续期按钮
-        # 这样不会错过验证窗口
         print("📡 开始监控 Turnstile Token...")
 
-        # 点击续期按钮（XPath，兼容性更好）
         renew_btn_xpaths = [
             "//button[contains(., '+8 Hours')]",
             "//a[contains(., '+8 Hours')]",
@@ -267,7 +252,6 @@ def renew_server(sb, server_id: str) -> dict:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
-        # 等待验证组件出现并处理
         print("⏳ 等待 Turnstile 验证组件...")
         sb.sleep(2)
 
@@ -278,9 +262,7 @@ def renew_server(sb, server_id: str) -> dict:
             print("✅ 验证组件就绪")
             print("📐 坐标计算完成")
             click_turnstile(sb)
-            wait_for_captcha_token(sb, timeout=90)
-
-            # 验证通过后点确认（部分面板需要）
+            wait_for_turnstile(sb, timeout=90)
             try:
                 sb.click(
                     "//button[@type='submit' or contains(., 'Confirm') or contains(., '确认')]",
@@ -296,7 +278,6 @@ def renew_server(sb, server_id: str) -> dict:
         sb.sleep(3)
         sb.save_screenshot(f"after_renew_{server_id}.png")
 
-        # 读取剩余时间
         remaining = ""
         for sel in ["[class*='remaining']", "[class*='time-left']", "[class*='expire']", ".remaining-time"]:
             try:
