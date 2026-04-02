@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-from bs4 import BeautifulSoup
 from seleniumbase import SB
 
 # ── 环境变量 ────────────────────────────────────────────────
@@ -20,8 +19,8 @@ def tg_send(text: str):
         parts   = TG_BOT.split(":")
         token   = parts[0] + ":" + parts[1]
         chat_id = parts[2]
-        url  = f"https://api.telegram.org/bot{token}/sendMessage"
-        resp = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+        url     = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp    = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
         if resp.ok:
             print("📨 TG推送成功")
         else:
@@ -47,164 +46,230 @@ def parse_accounts():
         accounts.append({"email": email, "password": password, "server_ids": server_ids})
     return accounts
 
-# ── requests 登录（绕过 reCAPTCHA）───────────────────────────
-def login_with_requests(email: str, password: str, proxy_str: str):
-    session = requests.Session()
-    proxies = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
-
-    # 1. 获取登录页拿 csrf token
-    print("🔑 获取登录页 CSRF Token...")
-    r = session.get(LOGIN_URL, proxies=proxies, timeout=15)
-    soup = BeautifulSoup(r.text, "html.parser")
-    csrf_meta = soup.find("meta", {"name": "csrf-token"})
-    if not csrf_meta:
-        raise RuntimeError("❌ 找不到 CSRF Token，页面结构可能已变化")
-    csrf = csrf_meta["content"]
-    print(f"✅ CSRF Token 获取成功：{csrf[:20]}...")
-
-    # 2. 提交登录表单
-    print("📤 提交登录请求...")
-    payload = {
-        "_token": csrf,
-        "user":   email,
-        "password": password,
-    }
-    headers = {
-        "Referer":      LOGIN_URL,
-        "X-CSRF-TOKEN": csrf,
-        "User-Agent":   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-    r2 = session.post(
-        LOGIN_URL, data=payload, headers=headers,
-        proxies=proxies, timeout=15, allow_redirects=True
-    )
-    print(f"🔁 登录响应URL：{r2.url}")
-    print(f"🔁 登录响应状态码：{r2.status_code}")
-
-    if "login" in r2.url.lower():
-        # 尝试打印错误提示
-        soup2 = BeautifulSoup(r2.text, "html.parser")
-        err = soup2.find(class_=lambda c: c and "error" in c.lower())
-        raise RuntimeError(f"❌ 登录失败：{err.get_text(strip=True) if err else '仍在登录页'}")
-
-    print(f"✅ 登录成功！当前URL：{r2.url}")
-    return session
-
-# ── 获取 cookies 注入浏览器 ──────────────────────────────────
-def inject_cookies(sb, session: requests.Session):
-    print("🍪 注入登录 Cookie 到浏览器...")
-    sb.open(BASE_URL)
-    for cookie in session.cookies:
-        sb.execute_script(
-            f"document.cookie = '{cookie.name}={cookie.value}; path=/; domain={cookie.domain}';"
-        )
-    sb.sleep(1)
-    print("✅ Cookie 注入完成")
-
-# ── 等待 Turnstile Token ─────────────────────────────────────
-def wait_for_turnstile(sb, timeout=60):
-    print("📡 开始监控 Turnstile Token...")
-    print("⏳ 等待验证组件加载...")
+# ── 等待 Turnstile Token（iframe 轮询）────────────────────────
+def wait_for_turnstile(sb, timeout=90):
+    print("📡 开始轮询 Turnstile Token...")
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # 方式1：直接在主页面查找隐藏 input
         try:
             token = sb.execute_script(
-                "return document.querySelector('[name=cf-turnstile-response]')?.value || '';"
+                "return document.querySelector('[name=\"cf-turnstile-response\"]')?.value || '';"
             )
             if token and len(token) > 20:
-                print(f"✅ Cloudflare Turnstile 验证通过！token：{token[:60]}...")
+                print(f"✅ Turnstile Token 获取成功（主页面）：{token[:40]}...")
                 return token
         except Exception:
             pass
-        time.sleep(1)
-    raise TimeoutError("❌ Turnstile Token 等待超时")
 
-# ── 点击 Turnstile iframe ────────────────────────────────────
-def click_turnstile(sb):
-    print("📐 坐标计算完成")
-    try:
-        sb.switch_to_frame("iframe[src*='challenges.cloudflare.com']")
-        sb.click("input[type='checkbox']", timeout=10)
-        sb.switch_to_default_content()
-    except Exception:
+        # 方式2：遍历所有 iframe 查找 token
         try:
-            sb.switch_to_default_content()
-            sb.execute_script("""
-                const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                if (iframe) {
-                    const rect = iframe.getBoundingClientRect();
-                    const x = rect.left + rect.width / 2;
-                    const y = rect.top + rect.height / 2;
-                    document.elementFromPoint(x, y)?.click();
-                }
-            """)
-        except Exception as e:
-            print(f"⚠️ Turnstile 点击异常: {e}")
-    print("📐 坐标点击成功")
+            iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
+            for i in range(iframe_count):
+                try:
+                    token = sb.execute_script(f"""
+                        try {{
+                            var iframe = document.querySelectorAll('iframe')[{i}];
+                            var doc = iframe.contentDocument || iframe.contentWindow.document;
+                            var el = doc.querySelector('[name="cf-turnstile-response"]');
+                            return el ? el.value : '';
+                        }} catch(e) {{ return ''; }}
+                    """)
+                    if token and len(token) > 20:
+                        print(f"✅ Turnstile Token 获取成功（iframe[{i}]）：{token[:40]}...")
+                        return token
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    raise TimeoutError("❌ Turnstile Token 等待超时（90s）")
+
+# ── 点击 Turnstile iframe 中心 ───────────────────────────────
+def click_turnstile(sb):
+    print("🖱️ 尝试点击 Turnstile 复选框...")
+    try:
+        sb.sleep(2)
+        # 滚动到 iframe 位置并点击中心
+        sb.execute_script("""
+            var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (iframe) {
+                iframe.scrollIntoView({behavior: 'smooth', block: 'center'});
+            }
+        """)
+        sb.sleep(1)
+
+        iframe_el = sb.find_element("iframe[src*='challenges.cloudflare.com']")
+        rect = sb.execute_script(
+            "var r = arguments[0].getBoundingClientRect();"
+            "return {x: r.left + 20, y: r.top + r.height / 2};",
+            iframe_el
+        )
+
+        from selenium.webdriver.common.action_chains import ActionChains
+        ActionChains(sb.driver) \
+            .move_by_offset(rect["x"], rect["y"]) \
+            .click() \
+            .move_by_offset(-rect["x"], -rect["y"]) \
+            .perform()
+        print("✅ Turnstile 点击完成")
+    except Exception as e:
+        print(f"⚠️ Turnstile 点击异常（将依赖自动验证）: {e}")
+
+# ── 浏览器登录（完整流程）────────────────────────────────────
+def browser_login(sb, email: str, password: str):
+    print(f"🔑 打开登录页：{LOGIN_URL}")
+    sb.open(LOGIN_URL)
+    sb.sleep(3)
+
+    print("📝 填写登录表单...")
+    # 填邮箱
+    sb.type("input[name='user'], input[type='email'], #user, #email", email)
+    sb.sleep(0.5)
+    # 填密码
+    sb.type("input[name='password'], input[type='password'], #password", password)
+    sb.sleep(0.5)
+
+    sb.save_screenshot("before_login.png")
+
+    # 检查是否有 Turnstile
+    has_turnstile = sb.execute_script(
+        "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
+    )
+    if has_turnstile:
+        print("🛡️ 检测到 Turnstile，等待自动验证...")
+        click_turnstile(sb)
+        wait_for_turnstile(sb, timeout=90)
+    else:
+        print("ℹ️ 未检测到 Turnstile，直接提交")
+
+    # 点击登录按钮
+    print("🚀 提交登录...")
+    login_btn_selectors = [
+        "button[type='submit']",
+        "input[type='submit']",
+        "//button[contains(., 'Login')]",
+        "//button[contains(., '登录')]",
+        "//button[contains(., 'Sign in')]",
+    ]
+    for sel in login_btn_selectors:
+        try:
+            by = "xpath" if sel.startswith("//") else "css selector"
+            sb.click(sel, timeout=5, by=by)
+            print(f"✅ 登录按钮已点击：{sel}")
+            break
+        except Exception:
+            continue
+
+    # 等待跳转
+    sb.sleep(5)
+    sb.save_screenshot("after_login.png")
+
+    current = sb.get_current_url()
+    print(f"🔁 登录后URL：{current}")
+
+    if "login" in current.lower():
+        raise RuntimeError(f"❌ 登录失败，仍在登录页：{current}")
+
+    # 额外验证：页面是否包含 MANAGE SERVER 或用户名
+    try:
+        page_text = sb.get_page_source()
+        if "MANAGE" not in page_text.upper() and "dashboard" not in current.lower():
+            raise RuntimeError("❌ 登录后页面内容异常，未找到预期的面板内容")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+
+    print(f"✅ 登录成功！当前URL：{current}")
 
 # ── 单服务器续期 ─────────────────────────────────────────────
 def renew_server(sb, server_id: str) -> dict:
     result = {"server_id": server_id, "name": server_id, "success": False, "remaining": "", "error": ""}
     server_url = f"{BASE_URL}/server/{server_id}"
     try:
-        print(f"🔗 导航到服务器页面：{server_url}")
+        print(f"\n🔗 导航到服务器页面：{server_url}")
         sb.open(server_url)
-        print("⏳ 等待服务器页面加载...")
+        sb.sleep(3)
         sb.wait_for_element_present("body", timeout=20)
-        print("✅ 服务器页面加载完成")
 
-        print("🔍 读取服务器名称...")
-        try:
-            name = sb.get_text("h1, .server-name, [class*='server-name'], [class*='title']", timeout=5)
-            name = name.strip().splitlines()[0]
-        except Exception:
-            name = server_id
+        # 读取服务器名称
+        name = server_id
+        for sel in ["h1", ".server-name", "[class*='server-name']", "[class*='title']"]:
+            try:
+                raw = sb.get_text(sel, timeout=3).strip()
+                if raw:
+                    name = raw.splitlines()[0]
+                    break
+            except Exception:
+                continue
         result["name"] = name
-        print(f"🖥 服务器名称：{name}")
+        print(f"🖥️  服务器名称：{name}")
 
-        print("🔄 开始执行续期流程...")
+        sb.save_screenshot(f"before_renew_{server_id}.png")
 
-        renew_btn_selectors = [
-            "button:contains('+8 Hours')",
-            "button:contains('Renew')",
-            "a:contains('+8 Hours')",
-            "[class*='renew']",
-            "button[id*='renew']",
+        # 点击续期按钮（XPath 方式）
+        renew_btn_xpaths = [
+            "//button[contains(., '+8 Hours')]",
+            "//a[contains(., '+8 Hours')]",
+            "//button[contains(., 'Renew')]",
+            "//a[contains(., 'Renew')]",
+            "//*[contains(@class,'renew')]",
+            "//*[contains(@id,'renew')]",
         ]
         clicked = False
-        for sel in renew_btn_selectors:
+        for xpath in renew_btn_xpaths:
             try:
-                sb.click(sel, timeout=5)
-                print("🔄 +8 Hours 续期按钮已点击")
+                sb.click(xpath, timeout=5, by="xpath")
+                print(f"✅ 续期按钮已点击：{xpath}")
                 clicked = True
                 break
             except Exception:
                 continue
+
         if not clicked:
-            raise RuntimeError("找不到续期按钮")
+            sb.save_screenshot(f"no_renew_btn_{server_id}.png")
+            raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
-        print("⏳ 等待 Turnstile 验证组件...")
-        time.sleep(2)
-        click_turnstile(sb)
-        wait_for_turnstile(sb, timeout=60)
-
-        print("⏳ 等待续期完成...")
-        time.sleep(3)
-
-        remaining = ""
-        for sel in ["[class*='remaining']", "[class*='time-left']", "[class*='expire']", ".remaining-time"]:
+        # 处理 Turnstile
+        sb.sleep(2)
+        has_turnstile = sb.execute_script(
+            "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
+        )
+        if has_turnstile:
+            print("🛡️ 检测到续期 Turnstile，开始处理...")
+            click_turnstile(sb)
+            wait_for_turnstile(sb, timeout=90)
+            # 验证通过后提交（部分面板需要再点确认）
             try:
-                remaining = sb.get_text(sel, timeout=5).strip()
+                sb.click("//button[@type='submit' or contains(.,'Confirm') or contains(.,'确认')]",
+                         timeout=5, by="xpath")
+                print("✅ 续期确认按钮已点击")
+            except Exception:
+                pass
+        else:
+            print("ℹ️ 续期无需 Turnstile 验证")
+
+        sb.sleep(4)
+        sb.save_screenshot(f"after_renew_{server_id}.png")
+
+        # 读取剩余时间
+        remaining = ""
+        for sel in ["[class*='remaining']", "[class*='time-left']", "[class*='expire']", ".remaining-time",
+                    "//*/text()[contains(.,'remaining') or contains(.,'剩余')]"]:
+            try:
+                by = "xpath" if sel.startswith("//") else "css selector"
+                remaining = sb.get_text(sel, timeout=3, by=by).strip()
                 if remaining:
                     break
             except Exception:
                 continue
 
-        sb.save_screenshot(f"renew_{server_id}.png")
         result["success"]   = True
         result["remaining"] = remaining
-        print(f"🎉 续期成功！剩余时间：{remaining}")
+        print(f"🎉 续期成功！剩余时间：{remaining or '（未能读取）'}")
 
     except Exception as e:
         result["error"] = str(e)
@@ -228,40 +293,28 @@ def process_account(account: dict):
     print("🌐 验证出口IP...")
     try:
         proxies  = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
-        ip_data  = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10).json()
-        raw_ip   = ip_data.get("ip", "unknown")
-        ip_masked = ".".join(raw_ip.split(".")[:3]) + ".xx"
-        print(f'✅ 出口IP确认：{{"ip":"{ip_masked}"}} Pretty-print')
+        raw_ip   = requests.get("https://api.ipify.org", proxies=proxies, timeout=10).text.strip()
+        ip_parts = raw_ip.split(".")
+        ip_masked = ".".join(ip_parts[:3]) + ".xx"
+        print(f"✅ 出口IP确认：{ip_masked}")
     except Exception as e:
         print(f"⚠️ 出口IP验证失败: {e}，继续...")
 
-    # requests 登录（绕过 reCAPTCHA）
-    session = login_with_requests(email, password, proxy_str)
-
-    # 启动浏览器并注入 cookie
     sb_kwargs = dict(uc=True, headless=True)
     if proxy_str:
         sb_kwargs["proxy"] = proxy_str
 
     results = []
     with SB(**sb_kwargs) as sb:
-        print("🔧 启动浏览器...")
-        print("🚀 浏览器就绪！")
+        print("🔧 浏览器已启动")
 
-        inject_cookies(sb, session)
-
-        # 验证 cookie 是否有效（访问面板首页）
-        sb.open(BASE_URL)
-        sb.sleep(3)
-        current = sb.get_current_url()
-        if "login" in current.lower():
-            sb.save_screenshot("cookie_inject_failed.png")
-            raise RuntimeError("Cookie 注入后仍跳转到登录页，登录态无效")
-        print(f"✅ 会话有效，当前页面：{current}")
+        # 全程用浏览器登录
+        browser_login(sb, email, password)
 
         for sid in server_ids:
             r = renew_server(sb, sid)
             results.append(r)
+            sb.sleep(2)
 
     return results
 
@@ -297,10 +350,10 @@ def main():
             print(f"❌ 账号 {acc['email']} 处理失败: {e}")
             all_results.append({
                 "server_id": ",".join(acc["server_ids"]),
-                "name": acc["email"],
-                "success": False,
+                "name":      acc["email"],
+                "success":   False,
                 "remaining": "",
-                "error": str(e),
+                "error":     str(e),
             })
 
     msg = build_tg_message(all_results)
@@ -309,7 +362,6 @@ def main():
     success_count = sum(1 for r in all_results if r["success"])
     total_count   = len(all_results)
     print(f"\n🏁 完成：{success_count}/{total_count} 台服务器续期成功")
-
 
 if __name__ == "__main__":
     main()
