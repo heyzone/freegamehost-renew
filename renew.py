@@ -1,224 +1,15 @@
 import os
 import time
 import requests
-import zipfile
-import json
 from seleniumbase import SB
 
 # ── 环境变量 ────────────────────────────────────────────────
-RAW_ACCOUNT  = os.environ.get("FGH_ACCOUNT", "")
-GOST_PROXY   = os.environ.get("GOST_PROXY", "")
-TG_BOT       = os.environ.get("TG_BOT", "")
-NOPECHA_KEY  = os.environ.get("NOPECHA_KEY", "")
+RAW_ACCOUNT = os.environ.get("FGH_ACCOUNT", "")
+GOST_PROXY  = os.environ.get("GOST_PROXY", "")
+TG_BOT      = os.environ.get("TG_BOT", "")
 
 BASE_URL  = "https://panel.freegamehost.xyz"
 LOGIN_URL = f"{BASE_URL}/auth/login"
-
-NOPECHA_EXT_PATH = "/tmp/nopecha_extension"
-
-# ── 构建 NopeCHA 插件 ────────────────────────────────────────
-def build_nopecha_extension(api_key: str, ext_dir: str):
-    os.makedirs(ext_dir, exist_ok=True)
-
-    manifest = {
-        "manifest_version": 3,
-        "name": "NopeCHA",
-        "version": "1.0",
-        "description": "NopeCHA captcha solver",
-        "permissions": ["storage", "scripting", "tabs"],
-        "host_permissions": ["<all_urls>"],
-        "content_scripts": [
-            {
-                "matches": ["<all_urls>"],
-                "js": ["content.js"],
-                "run_at": "document_start",
-                "all_frames": True
-            }
-        ],
-        "background": {"service_worker": "background.js"}
-    }
-
-    # background.js：设置 API key
-    background_js = f"""
-chrome.runtime.onInstalled.addListener(function() {{
-    chrome.storage.local.set({{
-        "apiKey": "{api_key}",
-        "enabled": true,
-        "autoSolve": true
-    }});
-}});
-"""
-
-    # content.js：自动解决 reCAPTCHA
-    content_js = """
-(function() {
-    'use strict';
-
-    var NOPECHA_API_KEY = null;
-
-    // 获取 API key
-    function getApiKey(cb) {
-        if (NOPECHA_API_KEY) { cb(NOPECHA_API_KEY); return; }
-        try {
-            chrome.storage.local.get(['apiKey'], function(result) {
-                NOPECHA_API_KEY = result.apiKey || '';
-                cb(NOPECHA_API_KEY);
-            });
-        } catch(e) { cb(''); }
-    }
-
-    // 轮询直到 reCAPTCHA iframe 出现
-    function waitForRecaptchaFrame(cb, tries) {
-        tries = tries || 0;
-        if (tries > 60) return;
-        var frames = document.querySelectorAll('iframe[src*="recaptcha"]');
-        if (frames.length > 0) {
-            cb(frames);
-        } else {
-            setTimeout(function() { waitForRecaptchaFrame(cb, tries + 1); }, 500);
-        }
-    }
-
-    // 调用 NopeCHA API 解决 reCAPTCHA
-    function solveRecaptcha(sitekey, pageurl, apiKey, cb) {
-        var url = 'https://nopecha.com/api/token';
-        var payload = {
-            type: 'recaptcha2',
-            sitekey: sitekey,
-            url: pageurl,
-            key: apiKey
-        };
-        fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        })
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (data && data.data) {
-                cb(null, data.data);
-            } else if (data && data.id) {
-                // 异步轮询
-                pollToken(data.id, apiKey, cb, 0);
-            } else {
-                cb('no token: ' + JSON.stringify(data));
-            }
-        })
-        .catch(function(e) { cb(e.toString()); });
-    }
-
-    // 异步任务轮询
-    function pollToken(taskId, apiKey, cb, tries) {
-        if (tries > 60) { cb('poll timeout'); return; }
-        setTimeout(function() {
-            fetch('https://nopecha.com/api/token?id=' + taskId + '&key=' + apiKey)
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-                if (data && data.data) {
-                    cb(null, data.data);
-                } else {
-                    pollToken(taskId, apiKey, cb, tries + 1);
-                }
-            })
-            .catch(function() { pollToken(taskId, apiKey, cb, tries + 1); });
-        }, 3000);
-    }
-
-    // 注入 token 到页面
-    function injectToken(token) {
-        // 写入所有 g-recaptcha-response textarea
-        var textareas = document.querySelectorAll('textarea[id*="g-recaptcha-response"]');
-        textareas.forEach(function(el) {
-            el.style.display = 'block';
-            el.value = token;
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-        });
-        // 触发 grecaptcha callback
-        try {
-            if (window.grecaptcha) {
-                var widgets = document.querySelectorAll('.g-recaptcha');
-                widgets.forEach(function(w) {
-                    var cb = w.getAttribute('data-callback');
-                    if (cb && window[cb]) {
-                        window[cb](token);
-                    }
-                });
-            }
-        } catch(e) {}
-        // 尝试触发 ___grecaptcha_cfg 内部回调
-        try {
-            var cfg = window.___grecaptcha_cfg;
-            if (cfg && cfg.clients) {
-                Object.values(cfg.clients).forEach(function(client) {
-                    Object.values(client).forEach(function(widget) {
-                        if (widget && widget.callback) {
-                            try { widget.callback(token); } catch(e) {}
-                        }
-                    });
-                });
-            }
-        } catch(e) {}
-    }
-
-    // 提取 sitekey
-    function getSitekey() {
-        // 方式1: data-sitekey 属性
-        var el = document.querySelector('[data-sitekey]');
-        if (el) return el.getAttribute('data-sitekey');
-        // 方式2: iframe src 里解析
-        var iframe = document.querySelector('iframe[src*="recaptcha"]');
-        if (iframe) {
-            var m = iframe.src.match(/[?&]k=([^&]+)/);
-            if (m) return m[1];
-        }
-        return null;
-    }
-
-    // 主流程
-    function main() {
-        getApiKey(function(apiKey) {
-            if (!apiKey) {
-                console.log('[NopeCHA] No API key');
-                return;
-            }
-            waitForRecaptchaFrame(function() {
-                var sitekey = getSitekey();
-                if (!sitekey) {
-                    console.log('[NopeCHA] No sitekey found');
-                    return;
-                }
-                console.log('[NopeCHA] Solving reCAPTCHA, sitekey:', sitekey);
-                solveRecaptcha(sitekey, window.location.href, apiKey, function(err, token) {
-                    if (err) {
-                        console.log('[NopeCHA] Error:', err);
-                        return;
-                    }
-                    console.log('[NopeCHA] Token received, injecting...');
-                    injectToken(token);
-                });
-            });
-        });
-    }
-
-    // 页面加载后执行
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', main);
-    } else {
-        setTimeout(main, 1000);
-    }
-})();
-"""
-
-    with open(os.path.join(ext_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=2)
-    with open(os.path.join(ext_dir, "background.js"), "w") as f:
-        f.write(background_js)
-    with open(os.path.join(ext_dir, "content.js"), "w") as f:
-        f.write(content_js)
-
-    print(f"✅ NopeCHA 插件构建完成：{ext_dir}")
-    return ext_dir
 
 # ── Telegram 推送 ────────────────────────────────────────────
 def tg_send(text: str):
@@ -245,6 +36,7 @@ def parse_accounts():
         line = line.strip()
         if not line:
             continue
+        # 最多切2刀，密码里有冒号也安全
         parts = line.split(":", 2)
         if len(parts) < 3:
             print(f"⚠️ 账号格式错误，跳过：{line}")
@@ -259,61 +51,24 @@ def parse_accounts():
         print(f"✅ 解析账号：{email}，服务器：{server_ids}")
     return accounts
 
-# ── 等待 reCAPTCHA Token ─────────────────────────────────────
-def wait_for_recaptcha(sb, timeout=120):
-    print("📡 开始轮询 reCAPTCHA Token...")
+# ── 等待 Turnstile / reCAPTCHA Token（通用轮询）─────────────
+def wait_for_captcha_token(sb, timeout=90):
+    print("📡 开始监控验证 Token...")
+    print("⏳ 等待验证组件加载...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 方式1：标准 id
-        try:
-            token = sb.execute_script(
-                "return document.getElementById('g-recaptcha-response')?.value || '';"
-            )
-            if token and len(token) > 20:
-                print(f"✅ reCAPTCHA Token 获取成功：{token[:40]}...")
-                return token
-        except Exception:
-            pass
-
-        # 方式2：遍历所有 g-recaptcha-response 元素
-        try:
-            token = sb.execute_script("""
-                var els = document.querySelectorAll(
-                    '[id*="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
-                );
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].value && els[i].value.length > 20) return els[i].value;
-                }
-                return '';
-            """)
-            if token and len(token) > 20:
-                print(f"✅ reCAPTCHA Token 获取成功（备用）：{token[:40]}...")
-                return token
-        except Exception:
-            pass
-
-        remaining = int(deadline - time.time())
-        if remaining % 10 == 0 and remaining > 0:
-            print(f"⏳ 等待 reCAPTCHA 通过...（剩余 {remaining}s）")
-        time.sleep(1)
-
-    raise TimeoutError("❌ reCAPTCHA 等待超时（120s）")
-
-# ── 等待 Turnstile Token（续期页用）─────────────────────────
-def wait_for_turnstile(sb, timeout=90):
-    print("📡 开始轮询 Turnstile Token...")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+        # 优先检查 Turnstile
         try:
             token = sb.execute_script(
                 "return document.querySelector('[name=\"cf-turnstile-response\"]')?.value || '';"
             )
             if token and len(token) > 20:
-                print(f"✅ Turnstile Token 获取成功（主页面）：{token[:40]}...")
-                return token
+                print(f"✅ Cloudflare Turnstile 验证通过！token：{token[:60]}...")
+                return "turnstile", token
         except Exception:
             pass
 
+        # 遍历 iframe 查 Turnstile
         try:
             iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
             for i in range(iframe_count):
@@ -327,27 +82,43 @@ def wait_for_turnstile(sb, timeout=90):
                         }} catch(e) {{ return ''; }}
                     """)
                     if token and len(token) > 20:
-                        print(f"✅ Turnstile Token 获取成功（iframe[{i}]）：{token[:40]}...")
-                        return token
+                        print(f"✅ Cloudflare Turnstile 验证通过（iframe[{i}]）！token：{token[:60]}...")
+                        return "turnstile", token
                 except Exception:
                     pass
         except Exception:
             pass
 
+        # 检查 reCAPTCHA
+        try:
+            token = sb.execute_script("""
+                var els = document.querySelectorAll(
+                    '[id*="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
+                );
+                for (var i = 0; i < els.length; i++) {
+                    if (els[i].value && els[i].value.length > 20) return els[i].value;
+                }
+                return '';
+            """)
+            if token and len(token) > 20:
+                print(f"✅ reCAPTCHA 验证通过！token：{token[:60]}...")
+                return "recaptcha", token
+        except Exception:
+            pass
+
         time.sleep(1)
 
-    raise TimeoutError("❌ Turnstile Token 等待超时（90s）")
+    raise TimeoutError(f"❌ 验证 Token 等待超时（{timeout}s）")
 
-# ── 点击 Turnstile iframe 中心（续期页用）───────────────────
+# ── 点击 Turnstile iframe 中心 ───────────────────────────────
 def click_turnstile(sb):
-    print("🖱️ 尝试点击 Turnstile 复选框...")
     try:
-        sb.sleep(2)
+        sb.sleep(1)
         sb.execute_script("""
             var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
             if (iframe) { iframe.scrollIntoView({behavior: 'smooth', block: 'center'}); }
         """)
-        sb.sleep(1)
+        sb.sleep(0.5)
         iframe_el = sb.find_element("iframe[src*='challenges.cloudflare.com']")
         rect = sb.execute_script(
             "var r = arguments[0].getBoundingClientRect();"
@@ -360,20 +131,21 @@ def click_turnstile(sb):
             .click() \
             .move_by_offset(-rect["x"], -rect["y"]) \
             .perform()
-        print("✅ Turnstile 点击完成")
+        print("📐 坐标点击成功")
     except Exception as e:
-        print(f"⚠️ Turnstile 点击异常（将依赖自动验证）: {e}")
+        print(f"⚠️ Turnstile 点击异常（依赖自动验证）: {e}")
 
 # ── 浏览器登录 ───────────────────────────────────────────────
 def browser_login(sb, email: str, password: str):
-    print(f"🔑 打开登录页：{LOGIN_URL}")
+    print("🔑 打开登录页面...")
     sb.open(LOGIN_URL)
     sb.sleep(5)
     sb.save_screenshot("login_page.png")
 
-    print("📝 填写登录表单...")
+    print("✏️ 填写账号密码...")
     try:
         sb.wait_for_element_present("input", timeout=15)
+        # Pterodactyl 是 React 框架，用 nativeInputValueSetter 触发状态更新
         email_js    = email.replace("\\", "\\\\").replace("'", "\\'")
         password_js = password.replace("\\", "\\\\").replace("'", "\\'")
         sb.execute_script(f"""
@@ -387,21 +159,34 @@ def browser_login(sb, email: str, password: str):
             inputs[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
         """)
         sb.sleep(0.5)
-        print("✅ 邮箱和密码填写完成")
     except Exception as e:
         sb.save_screenshot("input_error.png")
         raise RuntimeError(f"填写表单失败: {e}")
 
-    sb.save_screenshot("before_recaptcha.png")
+    sb.save_screenshot("before_submit.png")
 
-    # 等待 NopeCHA 插件自动解决 reCAPTCHA
-    print("🛡️ 等待 NopeCHA 自动解决 reCAPTCHA（最长120s）...")
-    wait_for_recaptcha(sb, timeout=120)
+    # 检查是否有验证（Turnstile 或 reCAPTCHA）
+    has_turnstile = sb.execute_script(
+        "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
+    )
+    has_recaptcha = sb.execute_script(
+        "return !!document.querySelector('iframe[src*=\"recaptcha\"]') || "
+        "!!document.querySelector('.g-recaptcha') || "
+        "!!document.getElementById('g-recaptcha-response');"
+    )
 
-    sb.save_screenshot("after_recaptcha.png")
+    if has_turnstile:
+        print("📡 开始监控 Turnstile Token（登录页）...")
+        click_turnstile(sb)
+        wait_for_captcha_token(sb, timeout=90)
+    elif has_recaptcha:
+        print("📡 检测到 reCAPTCHA，等待自动通过...")
+        wait_for_captcha_token(sb, timeout=120)
+    else:
+        print("ℹ️ 未检测到验证组件，直接提交")
 
-    # 点击 LOGIN 按钮
-    print("🚀 点击 LOGIN 按钮...")
+    # 提交登录
+    print("📤 提交登录请求...")
     try:
         sb.click(
             "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
@@ -412,7 +197,6 @@ def browser_login(sb, email: str, password: str):
             sb.click("button[type='submit']", timeout=5)
         except Exception:
             sb.execute_script("document.querySelector('button').click();")
-    print("✅ LOGIN 按钮已点击")
 
     print("⏳ 等待登录跳转...")
     sb.sleep(8)
@@ -425,18 +209,22 @@ def browser_login(sb, email: str, password: str):
         sb.save_screenshot("login_failed.png")
         raise RuntimeError(f"❌ 登录失败，仍在登录页：{current}")
 
-    print(f"✅ 登录成功！当前URL：{current}")
+    print(f"✅ 登录成功！当前页面：{current}")
 
 # ── 单服务器续期 ─────────────────────────────────────────────
 def renew_server(sb, server_id: str) -> dict:
     result = {"server_id": server_id, "name": server_id, "success": False, "remaining": "", "error": ""}
     server_url = f"{BASE_URL}/server/{server_id}"
     try:
-        print(f"\n🔗 导航到服务器页面：{server_url}")
+        print(f"🔗 导航到服务器页面：{server_url}")
         sb.open(server_url)
-        sb.sleep(3)
+        print("⏳ 等待服务器页面加载...")
         sb.wait_for_element_present("body", timeout=20)
+        sb.sleep(3)
+        print("✅ 服务器页面加载完成")
 
+        # 读取服务器名称
+        print("🔍 读取服务器名称...")
         name = server_id
         for sel in ["h1", ".server-name", "[class*='server-name']", "[class*='title']"]:
             try:
@@ -447,10 +235,16 @@ def renew_server(sb, server_id: str) -> dict:
             except Exception:
                 continue
         result["name"] = name
-        print(f"🖥️  服务器名称：{name}")
+        print(f"🖥 服务器名称：{name}")
 
+        print("🔄 开始执行续期流程...")
         sb.save_screenshot(f"before_renew_{server_id}.png")
 
+        # 先启动 Turnstile 监控（后台轮询），再点击续期按钮
+        # 这样不会错过验证窗口
+        print("📡 开始监控 Turnstile Token...")
+
+        # 点击续期按钮（XPath，兼容性更好）
         renew_btn_xpaths = [
             "//button[contains(., '+8 Hours')]",
             "//a[contains(., '+8 Hours')]",
@@ -463,7 +257,7 @@ def renew_server(sb, server_id: str) -> dict:
         for xpath in renew_btn_xpaths:
             try:
                 sb.click(xpath, timeout=5, by="xpath")
-                print(f"✅ 续期按钮已点击：{xpath}")
+                print(f"🔄 +8 Hours 续期按钮已点击")
                 clicked = True
                 break
             except Exception:
@@ -473,14 +267,20 @@ def renew_server(sb, server_id: str) -> dict:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
+        # 等待验证组件出现并处理
+        print("⏳ 等待 Turnstile 验证组件...")
         sb.sleep(2)
+
         has_turnstile = sb.execute_script(
             "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
         )
         if has_turnstile:
-            print("🛡️ 检测到续期 Turnstile，开始处理...")
+            print("✅ 验证组件就绪")
+            print("📐 坐标计算完成")
             click_turnstile(sb)
-            wait_for_turnstile(sb, timeout=90)
+            wait_for_captcha_token(sb, timeout=90)
+
+            # 验证通过后点确认（部分面板需要）
             try:
                 sb.click(
                     "//button[@type='submit' or contains(., 'Confirm') or contains(., '确认')]",
@@ -490,11 +290,13 @@ def renew_server(sb, server_id: str) -> dict:
             except Exception:
                 pass
         else:
-            print("ℹ️ 续期无需 Turnstile 验证")
+            print("ℹ️ 无需验证，续期直接完成")
 
-        sb.sleep(4)
+        print("⏳ 等待续期完成...")
+        sb.sleep(3)
         sb.save_screenshot(f"after_renew_{server_id}.png")
 
+        # 读取剩余时间
         remaining = ""
         for sel in ["[class*='remaining']", "[class*='time-left']", "[class*='expire']", ".remaining-time"]:
             try:
@@ -535,27 +337,15 @@ def process_account(account: dict):
     except Exception as e:
         print(f"⚠️ 出口IP验证失败: {e}，继续...")
 
-    # 构建 NopeCHA 插件（需要 NOPECHA_KEY）
-    ext_path = None
-    if NOPECHA_KEY:
-        print(f"🔧 构建 NopeCHA 插件（key: {NOPECHA_KEY[:8]}...）")
-        ext_path = build_nopecha_extension(NOPECHA_KEY, NOPECHA_EXT_PATH)
-    else:
-        print("⚠️ 未设置 NOPECHA_KEY，将尝试不使用插件（可能无法通过 reCAPTCHA）")
-
-    # SB 启动参数
-    sb_kwargs = dict(
-        uc=True,
-        headless=False,   # NopeCHA 插件需要非 headless 模式
-    )
+    sb_kwargs = dict(uc=True, headless=False)
     if proxy_str:
         sb_kwargs["proxy"] = proxy_str
-    if ext_path:
-        sb_kwargs["extension_dir"] = ext_path
 
     results = []
     with SB(**sb_kwargs) as sb:
-        print("🔧 浏览器已启动")
+        print("🔧 启动浏览器...")
+        print("🚀 浏览器就绪！")
+
         browser_login(sb, email, password)
 
         for sid in server_ids:
