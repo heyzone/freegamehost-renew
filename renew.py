@@ -36,22 +36,67 @@ def parse_accounts():
         line = line.strip()
         if not line:
             continue
-        parts = line.split(":")
+        # 最多切2刀，密码里有冒号也安全
+        parts = line.split(":", 2)
         if len(parts) < 3:
             print(f"⚠️ 账号格式错误，跳过：{line}")
             continue
         email      = parts[0].strip()
         password   = parts[1].strip()
         server_ids = [s.strip() for s in parts[2].split(",") if s.strip()]
+        if not server_ids:
+            print(f"⚠️ 未找到服务器ID，跳过：{line}")
+            continue
         accounts.append({"email": email, "password": password, "server_ids": server_ids})
+        print(f"✅ 解析账号：{email}，服务器：{server_ids}")
     return accounts
 
-# ── 等待 Turnstile Token（iframe 轮询）────────────────────────
+# ── 等待 reCAPTCHA v2 完成 ───────────────────────────────────
+def wait_for_recaptcha(sb, timeout=120):
+    print("📡 开始轮询 reCAPTCHA Token...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # 方式1：标准 id
+        try:
+            token = sb.execute_script(
+                "return document.getElementById('g-recaptcha-response')?.value || '';"
+            )
+            if token and len(token) > 20:
+                print(f"✅ reCAPTCHA Token 获取成功：{token[:40]}...")
+                return token
+        except Exception:
+            pass
+
+        # 方式2：遍历所有 g-recaptcha-response 元素
+        try:
+            token = sb.execute_script("""
+                var els = document.querySelectorAll(
+                    '[id*="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
+                );
+                for (var i = 0; i < els.length; i++) {
+                    if (els[i].value && els[i].value.length > 20) return els[i].value;
+                }
+                return '';
+            """)
+            if token and len(token) > 20:
+                print(f"✅ reCAPTCHA Token 获取成功（备用）：{token[:40]}...")
+                return token
+        except Exception:
+            pass
+
+        remaining = int(deadline - time.time())
+        if remaining % 10 == 0 and remaining > 0:
+            print(f"⏳ 等待 reCAPTCHA 通过...（剩余 {remaining}s）")
+        time.sleep(1)
+
+    raise TimeoutError("❌ reCAPTCHA 等待超时（120s）")
+
+# ── 等待 Turnstile Token（iframe 轮询，续期页用）─────────────
 def wait_for_turnstile(sb, timeout=90):
     print("📡 开始轮询 Turnstile Token...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 方式1：直接在主页面查找隐藏 input
+        # 方式1：主页面隐藏 input
         try:
             token = sb.execute_script(
                 "return document.querySelector('[name=\"cf-turnstile-response\"]')?.value || '';"
@@ -62,7 +107,7 @@ def wait_for_turnstile(sb, timeout=90):
         except Exception:
             pass
 
-        # 方式2：遍历所有 iframe 查找 token
+        # 方式2：遍历所有 iframe
         try:
             iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
             for i in range(iframe_count):
@@ -87,12 +132,11 @@ def wait_for_turnstile(sb, timeout=90):
 
     raise TimeoutError("❌ Turnstile Token 等待超时（90s）")
 
-# ── 点击 Turnstile iframe 中心 ───────────────────────────────
+# ── 点击 Turnstile iframe 中心（续期页用）───────────────────
 def click_turnstile(sb):
     print("🖱️ 尝试点击 Turnstile 复选框...")
     try:
         sb.sleep(2)
-        # 滚动到 iframe 位置并点击中心
         sb.execute_script("""
             var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
             if (iframe) {
@@ -100,14 +144,12 @@ def click_turnstile(sb):
             }
         """)
         sb.sleep(1)
-
         iframe_el = sb.find_element("iframe[src*='challenges.cloudflare.com']")
         rect = sb.execute_script(
             "var r = arguments[0].getBoundingClientRect();"
             "return {x: r.left + 20, y: r.top + r.height / 2};",
             iframe_el
         )
-
         from selenium.webdriver.common.action_chains import ActionChains
         ActionChains(sb.driver) \
             .move_by_offset(rect["x"], rect["y"]) \
@@ -118,70 +160,65 @@ def click_turnstile(sb):
     except Exception as e:
         print(f"⚠️ Turnstile 点击异常（将依赖自动验证）: {e}")
 
-# ── 浏览器登录（完整流程）────────────────────────────────────
+# ── 浏览器登录 ───────────────────────────────────────────────
 def browser_login(sb, email: str, password: str):
     print(f"🔑 打开登录页：{LOGIN_URL}")
     sb.open(LOGIN_URL)
-    sb.sleep(3)
+    sb.sleep(5)
+    sb.save_screenshot("login_page.png")
 
     print("📝 填写登录表单...")
-    # 填邮箱
-    sb.type("input[name='user'], input[type='email'], #user, #email", email)
-    sb.sleep(0.5)
-    # 填密码
-    sb.type("input[name='password'], input[type='password'], #password", password)
-    sb.sleep(0.5)
+    # Pterodactyl 面板 input 无 name/id，按顺序取第1、2个
+    try:
+        inputs = sb.find_elements("input")
+        if len(inputs) < 2:
+            raise RuntimeError(f"页面 input 数量不足：{len(inputs)}")
+        inputs[0].clear()
+        inputs[0].send_keys(email)
+        sb.sleep(0.5)
+        inputs[1].clear()
+        inputs[1].send_keys(password)
+        sb.sleep(0.5)
+        print("✅ 邮箱和密码填写完成")
+    except Exception as e:
+        sb.save_screenshot("input_error.png")
+        raise RuntimeError(f"填写表单失败: {e}")
 
-    sb.save_screenshot("before_login.png")
+    sb.save_screenshot("before_recaptcha.png")
 
-    # 检查是否有 Turnstile
-    has_turnstile = sb.execute_script(
-        "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
-    )
-    if has_turnstile:
-        print("🛡️ 检测到 Turnstile，等待自动验证...")
-        click_turnstile(sb)
-        wait_for_turnstile(sb, timeout=90)
-    else:
-        print("ℹ️ 未检测到 Turnstile，直接提交")
+    # 等待 reCAPTCHA 自动完成（UC模式会自动处理）
+    print("🛡️ 等待 reCAPTCHA 自动验证（最长120s）...")
+    wait_for_recaptcha(sb, timeout=120)
 
-    # 点击登录按钮
-    print("🚀 提交登录...")
-    login_btn_selectors = [
-        "button[type='submit']",
-        "input[type='submit']",
-        "//button[contains(., 'Login')]",
-        "//button[contains(., '登录')]",
-        "//button[contains(., 'Sign in')]",
-    ]
-    for sel in login_btn_selectors:
+    sb.save_screenshot("after_recaptcha.png")
+
+    # 点击 LOGIN 按钮
+    print("🚀 点击 LOGIN 按钮...")
+    try:
+        sb.click("//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
+                  timeout=10, by="xpath")
+    except Exception:
         try:
-            by = "xpath" if sel.startswith("//") else "css selector"
-            sb.click(sel, timeout=5, by=by)
-            print(f"✅ 登录按钮已点击：{sel}")
-            break
+            sb.click("button[type='submit']", timeout=5)
         except Exception:
-            continue
+            buttons = sb.find_elements("button")
+            if buttons:
+                buttons[0].click()
+            else:
+                raise RuntimeError("找不到登录按钮")
+    print("✅ LOGIN 按钮已点击")
 
     # 等待跳转
-    sb.sleep(5)
+    print("⏳ 等待登录跳转...")
+    sb.sleep(8)
     sb.save_screenshot("after_login.png")
 
     current = sb.get_current_url()
     print(f"🔁 登录后URL：{current}")
 
     if "login" in current.lower():
+        sb.save_screenshot("login_failed.png")
         raise RuntimeError(f"❌ 登录失败，仍在登录页：{current}")
-
-    # 额外验证：页面是否包含 MANAGE SERVER 或用户名
-    try:
-        page_text = sb.get_page_source()
-        if "MANAGE" not in page_text.upper() and "dashboard" not in current.lower():
-            raise RuntimeError("❌ 登录后页面内容异常，未找到预期的面板内容")
-    except RuntimeError:
-        raise
-    except Exception:
-        pass
 
     print(f"✅ 登录成功！当前URL：{current}")
 
@@ -210,7 +247,7 @@ def renew_server(sb, server_id: str) -> dict:
 
         sb.save_screenshot(f"before_renew_{server_id}.png")
 
-        # 点击续期按钮（XPath 方式）
+        # 点击续期按钮（XPath）
         renew_btn_xpaths = [
             "//button[contains(., '+8 Hours')]",
             "//a[contains(., '+8 Hours')]",
@@ -233,7 +270,7 @@ def renew_server(sb, server_id: str) -> dict:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
-        # 处理 Turnstile
+        # 检查是否有 Turnstile
         sb.sleep(2)
         has_turnstile = sb.execute_script(
             "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
@@ -242,10 +279,12 @@ def renew_server(sb, server_id: str) -> dict:
             print("🛡️ 检测到续期 Turnstile，开始处理...")
             click_turnstile(sb)
             wait_for_turnstile(sb, timeout=90)
-            # 验证通过后提交（部分面板需要再点确认）
+            # 验证通过后点确认（部分面板需要）
             try:
-                sb.click("//button[@type='submit' or contains(.,'Confirm') or contains(.,'确认')]",
-                         timeout=5, by="xpath")
+                sb.click(
+                    "//button[@type='submit' or contains(., 'Confirm') or contains(., '确认')]",
+                    timeout=5, by="xpath"
+                )
                 print("✅ 续期确认按钮已点击")
             except Exception:
                 pass
@@ -257,11 +296,12 @@ def renew_server(sb, server_id: str) -> dict:
 
         # 读取剩余时间
         remaining = ""
-        for sel in ["[class*='remaining']", "[class*='time-left']", "[class*='expire']", ".remaining-time",
-                    "//*/text()[contains(.,'remaining') or contains(.,'剩余')]"]:
+        for sel in [
+            "[class*='remaining']", "[class*='time-left']",
+            "[class*='expire']", ".remaining-time",
+        ]:
             try:
-                by = "xpath" if sel.startswith("//") else "css selector"
-                remaining = sb.get_text(sel, timeout=3, by=by).strip()
+                remaining = sb.get_text(sel, timeout=3).strip()
                 if remaining:
                     break
             except Exception:
@@ -308,7 +348,6 @@ def process_account(account: dict):
     with SB(**sb_kwargs) as sb:
         print("🔧 浏览器已启动")
 
-        # 全程用浏览器登录
         browser_login(sb, email, password)
 
         for sid in server_ids:
@@ -362,6 +401,7 @@ def main():
     success_count = sum(1 for r in all_results if r["success"])
     total_count   = len(all_results)
     print(f"\n🏁 完成：{success_count}/{total_count} 台服务器续期成功")
+
 
 if __name__ == "__main__":
     main()
