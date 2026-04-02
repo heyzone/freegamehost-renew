@@ -168,16 +168,19 @@ def browser_login(sb, email: str, password: str):
     sb.save_screenshot("login_page.png")
 
     print("📝 填写登录表单...")
-    # Pterodactyl 面板 input 无 name/id，按顺序取第1、2个
     try:
-        inputs = sb.find_elements("input")
-        if len(inputs) < 2:
-            raise RuntimeError(f"页面 input 数量不足：{len(inputs)}")
-        inputs[0].clear()
-        inputs[0].send_keys(email)
-        sb.sleep(0.5)
-        inputs[1].clear()
-        inputs[1].send_keys(password)
+        sb.wait_for_element_present("input", timeout=15)
+        # Pterodactyl 是 React 框架，需用 nativeInputValueSetter 触发状态更新
+        sb.execute_script("""
+            var inputs = document.querySelectorAll('input');
+            var setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
+            setter.call(inputs[0], arguments[0]);
+            inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+            setter.call(inputs[1], arguments[1]);
+            inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
+        """, email, password)
         sb.sleep(0.5)
         print("✅ 邮箱和密码填写完成")
     except Exception as e:
@@ -195,17 +198,15 @@ def browser_login(sb, email: str, password: str):
     # 点击 LOGIN 按钮
     print("🚀 点击 LOGIN 按钮...")
     try:
-        sb.click("//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
-                  timeout=10, by="xpath")
+        sb.click(
+            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
+            timeout=10, by="xpath"
+        )
     except Exception:
         try:
             sb.click("button[type='submit']", timeout=5)
         except Exception:
-            buttons = sb.find_elements("button")
-            if buttons:
-                buttons[0].click()
-            else:
-                raise RuntimeError("找不到登录按钮")
+            sb.execute_script("document.querySelector('button').click();")
     print("✅ LOGIN 按钮已点击")
 
     # 等待跳转
@@ -332,9 +333,9 @@ def process_account(account: dict):
     # 验证出口 IP
     print("🌐 验证出口IP...")
     try:
-        proxies  = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
-        raw_ip   = requests.get("https://api.ipify.org", proxies=proxies, timeout=10).text.strip()
-        ip_parts = raw_ip.split(".")
+        proxies   = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
+        raw_ip    = requests.get("https://api.ipify.org", proxies=proxies, timeout=10).text.strip()
+        ip_parts  = raw_ip.split(".")
         ip_masked = ".".join(ip_parts[:3]) + ".xx"
         print(f"✅ 出口IP确认：{ip_masked}")
     except Exception as e:
