@@ -170,17 +170,20 @@ def browser_login(sb, email: str, password: str):
     print("📝 填写登录表单...")
     try:
         sb.wait_for_element_present("input", timeout=15)
-        # Pterodactyl 是 React 框架，需用 nativeInputValueSetter 触发状态更新
-        sb.execute_script("""
+        # 直接把值嵌入JS字符串，避免 arguments 在箭头函数中不可用的问题
+        # 对反斜杠和单引号转义，防止JS字符串断裂
+        email_js    = email.replace("\\", "\\\\").replace("'", "\\'")
+        password_js = password.replace("\\", "\\\\").replace("'", "\\'")
+        sb.execute_script(f"""
             var inputs = document.querySelectorAll('input');
             var setter = Object.getOwnPropertyDescriptor(
                 window.HTMLInputElement.prototype, 'value'
             ).set;
-            setter.call(inputs[0], arguments[0]);
-            inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
-            setter.call(inputs[1], arguments[1]);
-            inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
-        """, email, password)
+            setter.call(inputs[0], '{email_js}');
+            inputs[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+            setter.call(inputs[1], '{password_js}');
+            inputs[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
+        """)
         sb.sleep(0.5)
         print("✅ 邮箱和密码填写完成")
     except Exception as e:
