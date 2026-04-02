@@ -1,15 +1,224 @@
 import os
 import time
 import requests
+import zipfile
+import json
 from seleniumbase import SB
 
 # ── 环境变量 ────────────────────────────────────────────────
-RAW_ACCOUNT = os.environ.get("FGH_ACCOUNT", "")
-GOST_PROXY  = os.environ.get("GOST_PROXY", "")
-TG_BOT      = os.environ.get("TG_BOT", "")
+RAW_ACCOUNT  = os.environ.get("FGH_ACCOUNT", "")
+GOST_PROXY   = os.environ.get("GOST_PROXY", "")
+TG_BOT       = os.environ.get("TG_BOT", "")
+NOPECHA_KEY  = os.environ.get("NOPECHA_KEY", "")
 
 BASE_URL  = "https://panel.freegamehost.xyz"
 LOGIN_URL = f"{BASE_URL}/auth/login"
+
+NOPECHA_EXT_PATH = "/tmp/nopecha_extension"
+
+# ── 构建 NopeCHA 插件 ────────────────────────────────────────
+def build_nopecha_extension(api_key: str, ext_dir: str):
+    os.makedirs(ext_dir, exist_ok=True)
+
+    manifest = {
+        "manifest_version": 3,
+        "name": "NopeCHA",
+        "version": "1.0",
+        "description": "NopeCHA captcha solver",
+        "permissions": ["storage", "scripting", "tabs"],
+        "host_permissions": ["<all_urls>"],
+        "content_scripts": [
+            {
+                "matches": ["<all_urls>"],
+                "js": ["content.js"],
+                "run_at": "document_start",
+                "all_frames": True
+            }
+        ],
+        "background": {"service_worker": "background.js"}
+    }
+
+    # background.js：设置 API key
+    background_js = f"""
+chrome.runtime.onInstalled.addListener(function() {{
+    chrome.storage.local.set({{
+        "apiKey": "{api_key}",
+        "enabled": true,
+        "autoSolve": true
+    }});
+}});
+"""
+
+    # content.js：自动解决 reCAPTCHA
+    content_js = """
+(function() {
+    'use strict';
+
+    var NOPECHA_API_KEY = null;
+
+    // 获取 API key
+    function getApiKey(cb) {
+        if (NOPECHA_API_KEY) { cb(NOPECHA_API_KEY); return; }
+        try {
+            chrome.storage.local.get(['apiKey'], function(result) {
+                NOPECHA_API_KEY = result.apiKey || '';
+                cb(NOPECHA_API_KEY);
+            });
+        } catch(e) { cb(''); }
+    }
+
+    // 轮询直到 reCAPTCHA iframe 出现
+    function waitForRecaptchaFrame(cb, tries) {
+        tries = tries || 0;
+        if (tries > 60) return;
+        var frames = document.querySelectorAll('iframe[src*="recaptcha"]');
+        if (frames.length > 0) {
+            cb(frames);
+        } else {
+            setTimeout(function() { waitForRecaptchaFrame(cb, tries + 1); }, 500);
+        }
+    }
+
+    // 调用 NopeCHA API 解决 reCAPTCHA
+    function solveRecaptcha(sitekey, pageurl, apiKey, cb) {
+        var url = 'https://nopecha.com/api/token';
+        var payload = {
+            type: 'recaptcha2',
+            sitekey: sitekey,
+            url: pageurl,
+            key: apiKey
+        };
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data && data.data) {
+                cb(null, data.data);
+            } else if (data && data.id) {
+                // 异步轮询
+                pollToken(data.id, apiKey, cb, 0);
+            } else {
+                cb('no token: ' + JSON.stringify(data));
+            }
+        })
+        .catch(function(e) { cb(e.toString()); });
+    }
+
+    // 异步任务轮询
+    function pollToken(taskId, apiKey, cb, tries) {
+        if (tries > 60) { cb('poll timeout'); return; }
+        setTimeout(function() {
+            fetch('https://nopecha.com/api/token?id=' + taskId + '&key=' + apiKey)
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data && data.data) {
+                    cb(null, data.data);
+                } else {
+                    pollToken(taskId, apiKey, cb, tries + 1);
+                }
+            })
+            .catch(function() { pollToken(taskId, apiKey, cb, tries + 1); });
+        }, 3000);
+    }
+
+    // 注入 token 到页面
+    function injectToken(token) {
+        // 写入所有 g-recaptcha-response textarea
+        var textareas = document.querySelectorAll('textarea[id*="g-recaptcha-response"]');
+        textareas.forEach(function(el) {
+            el.style.display = 'block';
+            el.value = token;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        // 触发 grecaptcha callback
+        try {
+            if (window.grecaptcha) {
+                var widgets = document.querySelectorAll('.g-recaptcha');
+                widgets.forEach(function(w) {
+                    var cb = w.getAttribute('data-callback');
+                    if (cb && window[cb]) {
+                        window[cb](token);
+                    }
+                });
+            }
+        } catch(e) {}
+        // 尝试触发 ___grecaptcha_cfg 内部回调
+        try {
+            var cfg = window.___grecaptcha_cfg;
+            if (cfg && cfg.clients) {
+                Object.values(cfg.clients).forEach(function(client) {
+                    Object.values(client).forEach(function(widget) {
+                        if (widget && widget.callback) {
+                            try { widget.callback(token); } catch(e) {}
+                        }
+                    });
+                });
+            }
+        } catch(e) {}
+    }
+
+    // 提取 sitekey
+    function getSitekey() {
+        // 方式1: data-sitekey 属性
+        var el = document.querySelector('[data-sitekey]');
+        if (el) return el.getAttribute('data-sitekey');
+        // 方式2: iframe src 里解析
+        var iframe = document.querySelector('iframe[src*="recaptcha"]');
+        if (iframe) {
+            var m = iframe.src.match(/[?&]k=([^&]+)/);
+            if (m) return m[1];
+        }
+        return null;
+    }
+
+    // 主流程
+    function main() {
+        getApiKey(function(apiKey) {
+            if (!apiKey) {
+                console.log('[NopeCHA] No API key');
+                return;
+            }
+            waitForRecaptchaFrame(function() {
+                var sitekey = getSitekey();
+                if (!sitekey) {
+                    console.log('[NopeCHA] No sitekey found');
+                    return;
+                }
+                console.log('[NopeCHA] Solving reCAPTCHA, sitekey:', sitekey);
+                solveRecaptcha(sitekey, window.location.href, apiKey, function(err, token) {
+                    if (err) {
+                        console.log('[NopeCHA] Error:', err);
+                        return;
+                    }
+                    console.log('[NopeCHA] Token received, injecting...');
+                    injectToken(token);
+                });
+            });
+        });
+    }
+
+    // 页面加载后执行
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', main);
+    } else {
+        setTimeout(main, 1000);
+    }
+})();
+"""
+
+    with open(os.path.join(ext_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    with open(os.path.join(ext_dir, "background.js"), "w") as f:
+        f.write(background_js)
+    with open(os.path.join(ext_dir, "content.js"), "w") as f:
+        f.write(content_js)
+
+    print(f"✅ NopeCHA 插件构建完成：{ext_dir}")
+    return ext_dir
 
 # ── Telegram 推送 ────────────────────────────────────────────
 def tg_send(text: str):
@@ -36,7 +245,6 @@ def parse_accounts():
         line = line.strip()
         if not line:
             continue
-        # 最多切2刀，密码里有冒号也安全
         parts = line.split(":", 2)
         if len(parts) < 3:
             print(f"⚠️ 账号格式错误，跳过：{line}")
@@ -51,7 +259,7 @@ def parse_accounts():
         print(f"✅ 解析账号：{email}，服务器：{server_ids}")
     return accounts
 
-# ── 等待 reCAPTCHA v2 完成 ───────────────────────────────────
+# ── 等待 reCAPTCHA Token ─────────────────────────────────────
 def wait_for_recaptcha(sb, timeout=120):
     print("📡 开始轮询 reCAPTCHA Token...")
     deadline = time.time() + timeout
@@ -91,12 +299,11 @@ def wait_for_recaptcha(sb, timeout=120):
 
     raise TimeoutError("❌ reCAPTCHA 等待超时（120s）")
 
-# ── 等待 Turnstile Token（iframe 轮询，续期页用）─────────────
+# ── 等待 Turnstile Token（续期页用）─────────────────────────
 def wait_for_turnstile(sb, timeout=90):
     print("📡 开始轮询 Turnstile Token...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 方式1：主页面隐藏 input
         try:
             token = sb.execute_script(
                 "return document.querySelector('[name=\"cf-turnstile-response\"]')?.value || '';"
@@ -107,7 +314,6 @@ def wait_for_turnstile(sb, timeout=90):
         except Exception:
             pass
 
-        # 方式2：遍历所有 iframe
         try:
             iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
             for i in range(iframe_count):
@@ -139,9 +345,7 @@ def click_turnstile(sb):
         sb.sleep(2)
         sb.execute_script("""
             var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            if (iframe) {
-                iframe.scrollIntoView({behavior: 'smooth', block: 'center'});
-            }
+            if (iframe) { iframe.scrollIntoView({behavior: 'smooth', block: 'center'}); }
         """)
         sb.sleep(1)
         iframe_el = sb.find_element("iframe[src*='challenges.cloudflare.com']")
@@ -170,8 +374,6 @@ def browser_login(sb, email: str, password: str):
     print("📝 填写登录表单...")
     try:
         sb.wait_for_element_present("input", timeout=15)
-        # 直接把值嵌入JS字符串，避免 arguments 在箭头函数中不可用的问题
-        # 对反斜杠和单引号转义，防止JS字符串断裂
         email_js    = email.replace("\\", "\\\\").replace("'", "\\'")
         password_js = password.replace("\\", "\\\\").replace("'", "\\'")
         sb.execute_script(f"""
@@ -192,8 +394,8 @@ def browser_login(sb, email: str, password: str):
 
     sb.save_screenshot("before_recaptcha.png")
 
-    # 等待 reCAPTCHA 自动完成（UC模式会自动处理）
-    print("🛡️ 等待 reCAPTCHA 自动验证（最长120s）...")
+    # 等待 NopeCHA 插件自动解决 reCAPTCHA
+    print("🛡️ 等待 NopeCHA 自动解决 reCAPTCHA（最长120s）...")
     wait_for_recaptcha(sb, timeout=120)
 
     sb.save_screenshot("after_recaptcha.png")
@@ -212,7 +414,6 @@ def browser_login(sb, email: str, password: str):
             sb.execute_script("document.querySelector('button').click();")
     print("✅ LOGIN 按钮已点击")
 
-    # 等待跳转
     print("⏳ 等待登录跳转...")
     sb.sleep(8)
     sb.save_screenshot("after_login.png")
@@ -236,7 +437,6 @@ def renew_server(sb, server_id: str) -> dict:
         sb.sleep(3)
         sb.wait_for_element_present("body", timeout=20)
 
-        # 读取服务器名称
         name = server_id
         for sel in ["h1", ".server-name", "[class*='server-name']", "[class*='title']"]:
             try:
@@ -251,7 +451,6 @@ def renew_server(sb, server_id: str) -> dict:
 
         sb.save_screenshot(f"before_renew_{server_id}.png")
 
-        # 点击续期按钮（XPath）
         renew_btn_xpaths = [
             "//button[contains(., '+8 Hours')]",
             "//a[contains(., '+8 Hours')]",
@@ -274,7 +473,6 @@ def renew_server(sb, server_id: str) -> dict:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
-        # 检查是否有 Turnstile
         sb.sleep(2)
         has_turnstile = sb.execute_script(
             "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
@@ -283,7 +481,6 @@ def renew_server(sb, server_id: str) -> dict:
             print("🛡️ 检测到续期 Turnstile，开始处理...")
             click_turnstile(sb)
             wait_for_turnstile(sb, timeout=90)
-            # 验证通过后点确认（部分面板需要）
             try:
                 sb.click(
                     "//button[@type='submit' or contains(., 'Confirm') or contains(., '确认')]",
@@ -298,12 +495,8 @@ def renew_server(sb, server_id: str) -> dict:
         sb.sleep(4)
         sb.save_screenshot(f"after_renew_{server_id}.png")
 
-        # 读取剩余时间
         remaining = ""
-        for sel in [
-            "[class*='remaining']", "[class*='time-left']",
-            "[class*='expire']", ".remaining-time",
-        ]:
+        for sel in ["[class*='remaining']", "[class*='time-left']", "[class*='expire']", ".remaining-time"]:
             try:
                 remaining = sb.get_text(sel, timeout=3).strip()
                 if remaining:
@@ -333,25 +526,36 @@ def process_account(account: dict):
 
     proxy_str = "http://127.0.0.1:8080" if GOST_PROXY else None
 
-    # 验证出口 IP
     print("🌐 验证出口IP...")
     try:
         proxies   = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
         raw_ip    = requests.get("https://api.ipify.org", proxies=proxies, timeout=10).text.strip()
-        ip_parts  = raw_ip.split(".")
-        ip_masked = ".".join(ip_parts[:3]) + ".xx"
+        ip_masked = ".".join(raw_ip.split(".")[:3]) + ".xx"
         print(f"✅ 出口IP确认：{ip_masked}")
     except Exception as e:
         print(f"⚠️ 出口IP验证失败: {e}，继续...")
 
-    sb_kwargs = dict(uc=True, headless=True)
+    # 构建 NopeCHA 插件（需要 NOPECHA_KEY）
+    ext_path = None
+    if NOPECHA_KEY:
+        print(f"🔧 构建 NopeCHA 插件（key: {NOPECHA_KEY[:8]}...）")
+        ext_path = build_nopecha_extension(NOPECHA_KEY, NOPECHA_EXT_PATH)
+    else:
+        print("⚠️ 未设置 NOPECHA_KEY，将尝试不使用插件（可能无法通过 reCAPTCHA）")
+
+    # SB 启动参数
+    sb_kwargs = dict(
+        uc=True,
+        headless=False,   # NopeCHA 插件需要非 headless 模式
+    )
     if proxy_str:
         sb_kwargs["proxy"] = proxy_str
+    if ext_path:
+        sb_kwargs["extension_dir"] = ext_path
 
     results = []
     with SB(**sb_kwargs) as sb:
         print("🔧 浏览器已启动")
-
         browser_login(sb, email, password)
 
         for sid in server_ids:
