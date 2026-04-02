@@ -2,7 +2,7 @@ name: FGH-Renew
 on:
   workflow_dispatch:
   schedule:
-    *- cron: '0 */6 * * *'
+    - cron: '0 */6 * * *'
 jobs:
   run_fgh_renew:
     runs-on: ubuntu-latest
@@ -11,16 +11,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 🐍 设置 Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
       - name: 🛡️ 启动 GOST 代理转发
-        if: ${{ env.GOST_PROXY != '' }}
+        if: ${{ secrets.GOST_PROXY != '' }}
         env:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
         run: |
-          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest \
+            | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
           echo "📦 GOST 版本: $VERSION"
           wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
           tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
@@ -29,7 +30,7 @@ jobs:
           sleep 3
           IP=$(curl -s -x http://127.0.0.1:8080 https://api.ipify.org)
           IP_MASKED=$(echo "$IP" | sed 's/\([0-9]*\.[0-9]*\.[0-9]*\.\)[0-9]*/\1xx/')
-          echo "✅ GOST 已启动，出口IP确认：$IP_MASKED"
+          echo "✅ GOST 已启动，出口IP：$IP_MASKED"
 
       - name: 🛠️ 安装系统依赖
         run: |
@@ -43,9 +44,7 @@ jobs:
 
       - name: 🐍 安装 Python 依赖
         run: |
-          pip install seleniumbase beautifulsoup4
-          seleniumbase install chromedriver
-
+          pip install seleniumbase beautifulsoup4 requests
 
       - name: 🚀 运行脚本
         env:
