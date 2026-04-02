@@ -30,7 +30,7 @@ jobs:
           sleep 3
           IP=$(curl -s -x http://127.0.0.1:8080 https://api.ipify.org)
           IP_MASKED=$(echo "$IP" | sed 's/\([0-9]*\.[0-9]*\.[0-9]*\.\)[0-9]*/\1xx/')
-          echo "✅ GOST 已启动，出口IP：$IP_MASKED"
+          echo "✅ GOST 已启动，出口IP确认：$IP_MASKED"
 
       - name: 🛠️ 安装系统依赖
         run: |
@@ -45,6 +45,7 @@ jobs:
       - name: 🐍 安装 Python 依赖
         run: |
           pip install seleniumbase requests
+          seleniumbase install chromedriver
 
       - name: 🚀 运行脚本
         env:
@@ -52,7 +53,6 @@ jobs:
           FGH_ACCOUNT: ${{ secrets.FGH_ACCOUNT }}
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
           TG_BOT: ${{ secrets.TG_BOT }}
-          NOPECHA_KEY: ${{ secrets.NOPECHA_KEY }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 
