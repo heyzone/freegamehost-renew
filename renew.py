@@ -1,6 +1,5 @@
 import os
 import time
-import urllib.parse
 import requests
 from seleniumbase import SB
 
@@ -10,46 +9,70 @@ PTERO_XSRF    = os.environ.get("PTERO_XSRF", "")
 CF_CLEARANCE  = os.environ.get("CF_CLEARANCE", "")
 GOST_PROXY    = os.environ.get("GOST_PROXY", "")
 TG_BOT        = os.environ.get("TG_BOT", "")
-
-SERVER_IDS = os.environ.get("SERVER_IDS", "")
+SERVER_IDS    = os.environ.get("SERVER_IDS", "")
 
 BASE_URL = "https://panel.freegamehost.xyz"
+DOMAIN   = "panel.freegamehost.xyz"
 
-# ── Telegram 推送 ────────────────────────────────────────────
+# ── TG 推送 ────────────────────────────────────────────────
 def tg_send(text: str):
     if not TG_BOT:
         return
     try:
-        parts   = TG_BOT.split(":")
-        token   = parts[0] + ":" + parts[1]
-        chat_id = parts[2]
-        url  = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+        token, chat_id = TG_BOT.rsplit(":", 1)
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
     except Exception as e:
-        print(f"⚠️ TG推送异常: {e}")
+        print(f"TG失败: {e}")
 
-# ── 注入 Cookie ─────────────────────────────────────────────
+# ── 注入 Cookie（修复版）────────────────────────────────────
 def inject_cookies(sb):
     print("🍪 注入 Cookie 登录...")
 
+    # 必须先打开域名
     sb.open(BASE_URL)
+    time.sleep(2)
 
-    cookies = {
-        "pterodactyl_session": PTERO_SESSION,
-        "XSRF-TOKEN": PTERO_XSRF,
-    }
+    cookies = []
+
+    if PTERO_SESSION:
+        cookies.append({
+            "name": "pterodactyl_session",
+            "value": PTERO_SESSION,
+            "domain": DOMAIN,
+            "path": "/",
+        })
+
+    if PTERO_XSRF:
+        cookies.append({
+            "name": "XSRF-TOKEN",
+            "value": PTERO_XSRF,
+            "domain": DOMAIN,
+            "path": "/",
+        })
 
     if CF_CLEARANCE:
-        cookies["cf_clearance"] = CF_CLEARANCE
+        cookies.append({
+            "name": "cf_clearance",
+            "value": CF_CLEARANCE,
+            "domain": DOMAIN,
+            "path": "/",
+        })
 
-    for k, v in cookies.items():
-        if v:
-            sb.execute_script(
-                f"document.cookie = '{k}={v}; path=/;';"
-            )
+    for c in cookies:
+        try:
+            sb.driver.add_cookie(c)
+            print(f"✅ 注入 {c['name']}")
+        except Exception as e:
+            print(f"⚠️ 注入失败 {c['name']}: {e}")
 
-    sb.sleep(2)
-    print("✅ Cookie 注入完成")
+    # 关键：刷新让 cookie 生效
+    sb.refresh()
+    time.sleep(3)
+
+    print("🔍 当前浏览器 Cookie：")
+    for c in sb.driver.get_cookies():
+        print(f" - {c['name']}")
 
 # ── Turnstile ──────────────────────────────────────────────
 def wait_for_turnstile(sb, timeout=60):
@@ -61,82 +84,55 @@ def wait_for_turnstile(sb, timeout=60):
             )
             if token and len(token) > 20:
                 return token
-        except Exception:
+        except:
             pass
         time.sleep(1)
-    raise TimeoutError("❌ Turnstile 超时")
+    raise TimeoutError("Turnstile 超时")
 
 def click_turnstile(sb):
     try:
         sb.switch_to_frame("iframe[src*='challenges.cloudflare.com']")
         sb.click("input[type='checkbox']", timeout=10)
         sb.switch_to_default_content()
-    except Exception:
+    except:
         sb.switch_to_default_content()
 
-# ── 单服务器续期 ─────────────────────────────────────────────
-def renew_server(sb, server_id: str) -> dict:
-    result = {"server_id": server_id, "name": server_id, "success": False, "remaining": "", "error": ""}
-    server_url = f"{BASE_URL}/server/{server_id}"
+# ── 续期 ───────────────────────────────────────────────────
+def renew_server(sb, server_id: str):
+    result = {"server_id": server_id, "success": False, "error": ""}
 
     try:
-        sb.open(server_url)
+        sb.open(f"{BASE_URL}/server/{server_id}")
         sb.wait_for_element_present("body", timeout=20)
 
-        try:
-            name = sb.get_text("h1", timeout=5).strip()
-        except:
-            name = server_id
+        selectors = ["button:contains('+8 Hours')", "[class*='renew']"]
 
-        result["name"] = name
-
-        selectors = [
-            "button:contains('+8 Hours')",
-            "button:contains('Renew')",
-            "[class*='renew']",
-        ]
-
-        clicked = False
         for sel in selectors:
             try:
                 sb.click(sel, timeout=5)
-                clicked = True
                 break
             except:
                 pass
-
-        if not clicked:
-            raise RuntimeError("找不到续期按钮")
+        else:
+            raise RuntimeError("找不到按钮")
 
         time.sleep(2)
         click_turnstile(sb)
         wait_for_turnstile(sb)
 
-        time.sleep(3)
-
-        try:
-            remaining = sb.get_text("[class*='remaining']", timeout=5)
-        except:
-            remaining = ""
-
         result["success"] = True
-        result["remaining"] = remaining
-
-        sb.save_screenshot(f"renew_{server_id}.png")
 
     except Exception as e:
         result["error"] = str(e)
-        sb.save_screenshot(f"error_{server_id}.png")
 
     return result
 
 # ── 主流程 ────────────────────────────────────────────────
 def main():
-    server_ids = [s.strip() for s in SERVER_IDS.split(",") if s.strip()]
-
     if not PTERO_SESSION:
-        print("❌ 缺少 PTERO_SESSION")
-        return
+        raise RuntimeError("缺少 PTERO_SESSION")
+
+    server_ids = [s.strip() for s in SERVER_IDS.split(",") if s.strip()]
 
     proxy_str = "http://127.0.0.1:8080" if GOST_PROXY else None
 
@@ -150,17 +146,21 @@ def main():
         inject_cookies(sb)
 
         sb.open(BASE_URL)
-        sb.sleep(3)
+        time.sleep(3)
 
-        if "login" in sb.get_current_url().lower():
-            raise RuntimeError("❌ Cookie 失效")
+        current = sb.get_current_url()
+        print(f"🌐 当前URL: {current}")
+
+        if "login" in current.lower():
+            sb.save_screenshot("cookie_invalid.png")
+            raise RuntimeError("❌ Cookie 失效（或未正确注入）")
+
+        print("✅ Cookie 登录成功")
 
         for sid in server_ids:
-            r = renew_server(sb, sid)
-            results.append(r)
+            results.append(renew_server(sb, sid))
 
-    msg = "\n".join([f"{'✅' if r['success'] else '❌'} {r['name']}" for r in results])
-    tg_send(msg)
+    tg_send(str(results))
 
 if __name__ == "__main__":
     main()
