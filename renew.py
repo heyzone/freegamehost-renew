@@ -54,12 +54,14 @@ def parse_accounts():
 def read_remaining_time(sb):
     try:
         val = sb.execute_script("""
-            var els = document.querySelectorAll('*');
-            for (var i = 0; i < els.length; i++) {
-                var t = (els[i].childNodes.length === 1 ? els[i].innerText || '' : '').trim();
-                if (/^\\d{2}\\s*:\\s*\\d{2}\\s*:\\s*\\d{2}$/.test(t)) return t;
-            }
-            return '';
+            (function() {
+                var els = document.querySelectorAll('*');
+                for (var i = 0; i < els.length; i++) {
+                    var t = (els[i].childNodes.length === 1 ? els[i].innerText || '' : '').trim();
+                    if (/^\\d{2}\\s*:\\s*\\d{2}\\s*:\\s*\\d{2}$/.test(t)) return t;
+                }
+                return '';
+            })();
         """)
         if val:
             return val.replace(" ", "")
@@ -73,14 +75,16 @@ def wait_and_click_turnstile(sb, timeout=30):
     deadline = time.time() + timeout
     while time.time() < deadline:
         is_ready = sb.execute_script("""
-            var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            if (!iframe) return false;
-            try {
-                var doc = iframe.contentDocument || iframe.contentWindow.document;
-                var cb = doc.querySelector('input[type="checkbox"]');
-                var label = doc.querySelector('.ctp-checkbox-label');
-                return !!(cb || label);
-            } catch(e) { return false; }
+            (function() {
+                var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                if (!iframe) return false;
+                try {
+                    var doc = iframe.contentDocument || iframe.contentWindow.document;
+                    var cb = doc.querySelector('input[type="checkbox"]');
+                    var label = doc.querySelector('.ctp-checkbox-label');
+                    return !!(cb || label);
+                } catch(e) { return false; }
+            })();
         """)
         if is_ready:
             print("✅ Turnstile 复选框已就绪，开始点击...")
@@ -89,14 +93,15 @@ def wait_and_click_turnstile(sb, timeout=30):
 
     try:
         sb.execute_script("""
-            var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            if (iframe) { iframe.scrollIntoView({behavior: 'smooth', block: 'center'}); }
+            (function() {
+                var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                if (iframe) { iframe.scrollIntoView({behavior: 'smooth', block: 'center'}); }
+            })();
         """)
         sb.sleep(0.5)
         iframe_el = sb.find_element("iframe[src*='challenges.cloudflare.com']")
         rect = sb.execute_script(
-            "var r = arguments[0].getBoundingClientRect();"
-            "return {x: r.left + 20, y: r.top + r.height / 2};",
+            "(function(el) { var r = el.getBoundingClientRect(); return {x: r.left + 20, y: r.top + r.height / 2}; })(arguments[0]);",
             iframe_el
         )
         from selenium.webdriver.common.action_chains import ActionChains
@@ -116,7 +121,7 @@ def wait_for_turnstile_token(sb, timeout=90):
     while time.time() < deadline:
         try:
             token = sb.execute_script(
-                "return document.querySelector('[name=\"cf-turnstile-response\"]')?.value || '';"
+                "(function() { return document.querySelector('[name=\"cf-turnstile-response\"]')?.value || ''; })();"
             )
             if token and len(token) > 20:
                 print(f"✅ Cloudflare Turnstile 验证通过！token：{token[:60]}...")
@@ -124,16 +129,20 @@ def wait_for_turnstile_token(sb, timeout=90):
         except Exception:
             pass
         try:
-            iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
+            iframe_count = sb.execute_script(
+                "(function() { return document.querySelectorAll('iframe').length; })();"
+            )
             for i in range(iframe_count):
                 try:
                     token = sb.execute_script(f"""
-                        try {{
-                            var iframe = document.querySelectorAll('iframe')[{i}];
-                            var doc = iframe.contentDocument || iframe.contentWindow.document;
-                            var el = doc.querySelector('[name="cf-turnstile-response"]');
-                            return el ? el.value : '';
-                        }} catch(e) {{ return ''; }}
+                        (function() {{
+                            try {{
+                                var iframe = document.querySelectorAll('iframe')[{i}];
+                                var doc = iframe.contentDocument || iframe.contentWindow.document;
+                                var el = doc.querySelector('[name="cf-turnstile-response"]');
+                                return el ? el.value : '';
+                            }} catch(e) {{ return ''; }}
+                        }})();
                     """)
                     if token and len(token) > 20:
                         print(f"✅ Cloudflare Turnstile 验证通过（iframe[{i}]）！token：{token[:60]}...")
@@ -152,7 +161,7 @@ def handle_renew_turnstile(sb, timeout_wait=15, timeout_token=90):
     appeared = False
     while time.time() < deadline:
         has = sb.execute_script(
-            "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
+            "(function() { return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]'); })();"
         )
         if has:
             appeared = True
@@ -181,14 +190,16 @@ def browser_login(sb, email: str, password: str):
         email_js    = email.replace("\\", "\\\\").replace("'", "\\'")
         password_js = password.replace("\\", "\\\\").replace("'", "\\'")
         sb.execute_script(f"""
-            var inputs = document.querySelectorAll('input');
-            var setter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            ).set;
-            setter.call(inputs[0], '{email_js}');
-            inputs[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
-            setter.call(inputs[1], '{password_js}');
-            inputs[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
+            (function() {{
+                var inputs = document.querySelectorAll('input');
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(inputs[0], '{email_js}');
+                inputs[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                setter.call(inputs[1], '{password_js}');
+                inputs[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
+            }})();
         """)
         sb.sleep(0.5)
         print("✅ 账号密码填写完成")
@@ -200,75 +211,67 @@ def browser_login(sb, email: str, password: str):
 
     # 检查是否有 Turnstile
     has_turnstile = sb.execute_script(
-        "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
+        "(function() { return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]'); })();"
     )
     if has_turnstile:
         print("🛡️ 登录页检测到 Turnstile，等待验证...")
         wait_and_click_turnstile(sb, timeout=30)
         wait_for_turnstile_token(sb, timeout=90)
 
-    # 打印当前所有按钮，便于调试
-    btns = sb.execute_script("""
-        var result = [];
-        document.querySelectorAll('button').forEach(function(el) {
-            result.push({text: (el.innerText||'').trim(), type: el.type, disabled: el.disabled});
-        });
-        return result;
-    """)
-    print(f"🔍 登录页按钮：{btns}")
-
     print("📤 提交登录请求...")
-    # 方式1：JS 直接点击 LOGIN 按钮（最可靠）
-    clicked = sb.execute_script("""
-        var btns = document.querySelectorAll('button');
-        for (var i = 0; i < btns.length; i++) {
-            var t = (btns[i].innerText || '').trim().toUpperCase();
-            if (t === 'LOGIN' || t.indexOf('LOGIN') !== -1) {
-                btns[i].click();
-                return true;
-            }
-        }
-        return false;
-    """)
-    if not clicked:
-        # 方式2：点第一个 submit 按钮
+    # 用 SeleniumBase 原生 click 点击 LOGIN 按钮（日志已确认按钮存在）
+    try:
+        # 按文字找 button，排除 Reload Page
+        sb.click("//button[normalize-space(.)='LOGIN']", timeout=8, by="xpath")
+        print("✅ LOGIN 按钮点击成功（xpath normalize-space）")
+    except Exception:
         try:
-            sb.click("button[type='submit']", timeout=5)
-            clicked = True
+            sb.click("//button[contains(.,'LOGIN') and not(contains(.,'Reload'))]",
+                     timeout=5, by="xpath")
+            print("✅ LOGIN 按钮点击成功（xpath contains）")
         except Exception:
-            pass
-    if not clicked:
-        # 方式3：点第一个 button
-        sb.execute_script("document.querySelector('button').click();")
-    print("✅ 登录按钮已点击")
+            try:
+                sb.click("button[type='submit']:last-of-type", timeout=5)
+                print("✅ LOGIN 按钮点击成功（css last-of-type）")
+            except Exception:
+                # 最后备用：找所有 submit 按钮，点最后一个（LOGIN 在 Reload Page 后面）
+                sb.execute_script("""
+                    (function() {
+                        var btns = document.querySelectorAll('button[type="submit"]');
+                        if (btns.length > 0) btns[btns.length - 1].click();
+                    })();
+                """)
+                print("✅ LOGIN 按钮点击成功（js last submit）")
 
     print("⏳ 等待登录跳转...")
-    sb.sleep(8)
+    sb.sleep(10)
     sb.save_screenshot("after_login.png")
 
     current = sb.get_current_url()
     print(f"🔁 登录后URL：{current}")
 
     if "login" in current.lower():
-        # 截图看页面是否有错误提示
-        err_msg = sb.execute_script("""
-            var els = document.querySelectorAll('*');
-            for (var i = 0; i < els.length; i++) {
-                var t = (els[i].innerText || '').trim();
-                if (t && t.length < 200 && (
-                    t.toLowerCase().includes('invalid') ||
-                    t.toLowerCase().includes('incorrect') ||
-                    t.toLowerCase().includes('error') ||
-                    t.toLowerCase().includes('wrong') ||
-                    t.toLowerCase().includes('fail')
-                ) && els[i].children.length === 0) {
-                    return t;
-                }
-            }
-            return '';
-        """)
-        if err_msg:
-            print(f"⚠️ 页面错误提示：{err_msg}")
+        # 读取页面错误提示
+        try:
+            err_msg = sb.execute_script("""
+                (function() {
+                    var els = document.querySelectorAll('*');
+                    for (var i = 0; i < els.length; i++) {
+                        var t = (els[i].innerText || '').trim();
+                        if (t && t.length < 200 && els[i].children.length === 0 && (
+                            t.toLowerCase().indexOf('invalid') !== -1 ||
+                            t.toLowerCase().indexOf('incorrect') !== -1 ||
+                            t.toLowerCase().indexOf('error') !== -1 ||
+                            t.toLowerCase().indexOf('wrong') !== -1
+                        )) return t;
+                    }
+                    return '';
+                })();
+            """)
+            if err_msg:
+                print(f"⚠️ 页面错误提示：{err_msg}")
+        except Exception:
+            pass
 
         print("⏳ 仍在登录页，再等 10s...")
         sb.sleep(10)
@@ -298,48 +301,51 @@ def renew_server(sb, server_id: str) -> dict:
         # ── 读取服务器名称 ───────────────────────────────────
         print("🔍 读取服务器名称...")
         name = sb.execute_script("""
-            var allEls = document.querySelectorAll('*');
-            for (var i = 0; i < allEls.length; i++) {
-                var t = (allEls[i].innerText || '').trim();
-                if (t.startsWith('ID:') && t.length < 30) {
-                    var parent = allEls[i].parentElement;
-                    if (parent) {
-                        var children = Array.from(parent.children);
-                        var idx = children.indexOf(allEls[i]);
-                        if (idx > 0) {
-                            var n = (children[idx - 1].innerText || '').trim();
-                            if (n && n.length < 50) return n;
-                        }
-                        var prev = parent.previousElementSibling;
-                        if (prev) {
-                            var n = (prev.innerText || '').trim().split('\\n')[0];
-                            if (n && n.length < 50 && !n.includes('/')) return n;
+            (function() {
+                var allEls = document.querySelectorAll('*');
+                for (var i = 0; i < allEls.length; i++) {
+                    var t = (allEls[i].innerText || '').trim();
+                    if (t.indexOf('ID:') === 0 && t.length < 30) {
+                        var parent = allEls[i].parentElement;
+                        if (parent) {
+                            var children = Array.from(parent.children);
+                            var idx = children.indexOf(allEls[i]);
+                            if (idx > 0) {
+                                var n = (children[idx - 1].innerText || '').trim();
+                                if (n && n.length < 50) return n;
+                            }
+                            var prev = parent.previousElementSibling;
+                            if (prev) {
+                                var n = (prev.innerText || '').trim().split('\\n')[0];
+                                if (n && n.length < 50 && n.indexOf('/') === -1) return n;
+                            }
                         }
                     }
-                }
-            }
-            return '';
-        """)
-        if not name:
-            blacklist = ['Dashboard','Account','Console','Files','Sign','Upgrade',
-                         'Ad ','Block','Detect','FreeGame','Premium','Reload','Online','Offline']
-            name = sb.execute_script("""
-                var blacklist = arguments[0];
-                var els = document.querySelectorAll('span,p,div,h1,h2,h3,h4');
-                for (var i = 0; i < els.length; i++) {
-                    var t = (els[i].innerText || '').trim();
-                    if (t.length < 2 || t.length > 30) continue;
-                    if (els[i].children.length > 0) continue;
-                    if (t.match(/^[0-9a-f-]{8}/i)) continue;
-                    if (t.includes('/') || t.includes('@') || t.includes('ID')) continue;
-                    var ok = true;
-                    for (var j = 0; j < blacklist.length; j++) {
-                        if (t.indexOf(blacklist[j]) !== -1) { ok = false; break; }
-                    }
-                    if (ok) return t;
                 }
                 return '';
-            """, blacklist)
+            })();
+        """)
+        if not name:
+            name = sb.execute_script("""
+                (function() {
+                    var blacklist = ['Dashboard','Account','Console','Files','Sign','Upgrade',
+                        'Ad ','Block','Detect','FreeGame','Premium','Reload','Online','Offline'];
+                    var els = document.querySelectorAll('span,p,div,h1,h2,h3,h4');
+                    for (var i = 0; i < els.length; i++) {
+                        var t = (els[i].innerText || '').trim();
+                        if (t.length < 2 || t.length > 30) continue;
+                        if (els[i].children.length > 0) continue;
+                        if (/^[0-9a-f-]{8}/i.test(t)) continue;
+                        if (t.indexOf('/') !== -1 || t.indexOf('@') !== -1 || t.indexOf('ID') !== -1) continue;
+                        var ok = true;
+                        for (var j = 0; j < blacklist.length; j++) {
+                            if (t.indexOf(blacklist[j]) !== -1) { ok = false; break; }
+                        }
+                        if (ok) return t;
+                    }
+                    return '';
+                })();
+            """)
         result["name"] = name or server_id
         print(f"🖥 服务器名称：{result['name']}")
 
