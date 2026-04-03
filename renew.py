@@ -473,6 +473,8 @@ def renew_server(sb, server_id: str) -> dict:
             except Exception:
                 continue
 
+        sb.sleep(15)
+        
         if not clicked:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
