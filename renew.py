@@ -50,7 +50,7 @@ def parse_accounts():
         print(f"✅ 解析账号：{email}，服务器：{server_ids}")
     return accounts
 
-# ── 读取页面时间（HH:MM:SS 格式，排除 00:00:00）────────────
+# ── 读取页面时间（HH:MM:SS 格式）────────────────────────────
 def read_remaining_time(sb):
     try:
         val = sb.execute_script("""
@@ -67,13 +67,11 @@ def read_remaining_time(sb):
         pass
     return ""
 
-# ── 等待 Turnstile 复选框出现并点击 ─────────────────────────
-# 点击按钮后会先显示 "Verifying..."，需要等复选框真正出现
+# ── 等待 Turnstile 复选框就绪并点击 ─────────────────────────
 def wait_and_click_turnstile(sb, timeout=30):
-    print("⏳ 等待 Turnstile 复选框出现（跳过 Verifying 状态）...")
+    print("⏳ 等待 Turnstile 复选框就绪（跳过 Verifying 状态）...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 检查是否已经显示复选框（不再是 Verifying 状态）
         is_ready = sb.execute_script("""
             var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
             if (!iframe) return false;
@@ -89,7 +87,6 @@ def wait_and_click_turnstile(sb, timeout=30):
             break
         time.sleep(1)
 
-    # 点击 iframe 中心偏左位置（复选框位置）
     try:
         sb.execute_script("""
             var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
@@ -126,7 +123,6 @@ def wait_for_turnstile_token(sb, timeout=90):
                 return token
         except Exception:
             pass
-
         try:
             iframe_count = sb.execute_script("return document.querySelectorAll('iframe').length;")
             for i in range(iframe_count):
@@ -146,14 +142,11 @@ def wait_for_turnstile_token(sb, timeout=90):
                     pass
         except Exception:
             pass
-
         time.sleep(1)
-
     raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
-# ── 等待并处理续期 Turnstile（含重试）───────────────────────
+# ── 处理续期页 Turnstile（等出现 + 等复选框 + 等token）──────
 def handle_renew_turnstile(sb, timeout_wait=15, timeout_token=90):
-    # 等待 Turnstile iframe 出现（点击续期按钮后可能需要几秒）
     print("⏳ 等待 Turnstile 验证组件出现...")
     deadline = time.time() + timeout_wait
     appeared = False
@@ -171,31 +164,11 @@ def handle_renew_turnstile(sb, timeout_wait=15, timeout_token=90):
         print("ℹ️ 无需 Turnstile 验证")
         return False
 
-    # 等复选框就绪后点击
     wait_and_click_turnstile(sb, timeout=30)
-
-    # 等待 token
     wait_for_turnstile_token(sb, timeout=timeout_token)
     return True
 
-# ── 点击 LOGIN 按钮 ──────────────────────────────────────────
-def click_login_button(sb):
-    try:
-        sb.click(
-            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
-            timeout=10, by="xpath"
-        )
-        return
-    except Exception:
-        pass
-    try:
-        sb.click("button[type='submit']", timeout=5)
-        return
-    except Exception:
-        pass
-    sb.execute_script("document.querySelector('button').click();")
-
-# ── 浏览器登录 ───────────────────────────────────────────────
+# ── 浏览器登录（保持与上一个成功版本一致）───────────────────
 def browser_login(sb, email: str, password: str):
     print("🔑 打开登录页面...")
     sb.open(LOGIN_URL)
@@ -217,32 +190,50 @@ def browser_login(sb, email: str, password: str):
             setter.call(inputs[1], '{password_js}');
             inputs[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
         """)
-        sb.sleep(1)
+        sb.sleep(0.5)
         print("✅ 账号密码填写完成")
     except Exception as e:
         sb.save_screenshot("input_error.png")
         raise RuntimeError(f"填写表单失败: {e}")
 
-    # 检查登录页是否有 Turnstile
+    sb.save_screenshot("before_submit.png")
+
+    # 检查是否有 Turnstile（登录页通常没有，直接提交）
     has_turnstile = sb.execute_script(
         "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
     )
     if has_turnstile:
-        print("🛡️ 登录页检测到 Turnstile...")
+        print("🛡️ 登录页检测到 Turnstile，等待验证...")
         wait_and_click_turnstile(sb, timeout=30)
         wait_for_turnstile_token(sb, timeout=90)
 
+    # 多等 3s 让 reCAPTCHA v3 隐式完成，再提交
+    print("⏳ 等待页面验证组件就绪（3s）...")
+    sb.sleep(3)
+
     print("📤 提交登录请求...")
-    click_login_button(sb)
+    try:
+        sb.click(
+            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
+            timeout=10, by="xpath"
+        )
+    except Exception:
+        try:
+            sb.click("button[type='submit']", timeout=5)
+        except Exception:
+            sb.execute_script("document.querySelector('button').click();")
 
     print("⏳ 等待登录跳转...")
     sb.sleep(8)
     sb.save_screenshot("after_login.png")
 
     current = sb.get_current_url()
+    print(f"🔁 登录后URL：{current}")
+
     if "login" in current.lower():
         print("⏳ 仍在登录页，再等 10s...")
         sb.sleep(10)
+        sb.save_screenshot("after_login2.png")
         current = sb.get_current_url()
 
     if "login" in current.lower():
@@ -265,30 +256,26 @@ def renew_server(sb, server_id: str) -> dict:
 
         sb.save_screenshot(f"loaded_{server_id}.png")
 
-        # ── 读取服务器名称（从侧边栏 ID 上方的名字）────────
+        # ── 读取服务器名称（侧边栏 kv1 在 ID: 上方）────────
         print("🔍 读取服务器名称...")
         name = sb.execute_script("""
-            // FGH 侧边栏结构：服务器名在 ID 上方，是短文本
-            // 找包含 "ID:" 文字的父元素，取其前一个兄弟节点
             var allEls = document.querySelectorAll('*');
             for (var i = 0; i < allEls.length; i++) {
                 var t = (allEls[i].innerText || '').trim();
                 if (t.startsWith('ID:') && t.length < 30) {
-                    // 找父级里 ID 上面的文字
                     var parent = allEls[i].parentElement;
                     if (parent) {
                         var children = Array.from(parent.children);
                         var idx = children.indexOf(allEls[i]);
                         if (idx > 0) {
                             var nameEl = children[idx - 1];
-                            var name = (nameEl.innerText || '').trim();
-                            if (name && name.length < 50) return name;
+                            var n = (nameEl.innerText || '').trim();
+                            if (n && n.length < 50) return n;
                         }
-                        // 尝试父级的前一个兄弟
                         var prev = parent.previousElementSibling;
                         if (prev) {
-                            var name = (prev.innerText || '').trim().split('\\n')[0];
-                            if (name && name.length < 50 && !name.includes('/')) return name;
+                            var n = (prev.innerText || '').trim().split('\\n')[0];
+                            if (n && n.length < 50 && !n.includes('/')) return n;
                         }
                     }
                 }
@@ -296,28 +283,22 @@ def renew_server(sb, server_id: str) -> dict:
             return '';
         """)
         if not name:
-            # 备用：取侧边栏里 ID 文字上方的短文本
+            # 备用：过滤干扰词，找短文本
             name = sb.execute_script("""
-                var spans = document.querySelectorAll('span, p, div, h1, h2, h3, h4');
-                for (var i = 0; i < spans.length; i++) {
-                    var t = (spans[i].innerText || '').trim();
-                    // 找紧跟在 ID 模式文本后面出现的短名字
-                    if (t.length > 0 && t.length < 30
-                        && spans[i].children.length === 0
-                        && !t.match(/^[0-9a-f-]{8}/i)
-                        && !t.includes('/')
-                        && !t.includes('@')
-                        && !t.includes('ID')
-                        && !t.includes('Ad ')
-                        && !t.includes('Block')
-                        && !t.includes('Detected')
-                        && !t.includes('Dashboard')
-                        && !t.includes('Account')
-                        && !t.includes('Console')
-                        && !t.includes('Sign')
-                        && !t.includes('Upgrade')) {
-                        return t;
+                var blacklist = ['Dashboard','Account','Console','Files','Sign','Upgrade',
+                    'Ad ','Block','Detect','FreeGame','Premium','Reload','Online','Offline'];
+                var els = document.querySelectorAll('span,p,div,h1,h2,h3,h4');
+                for (var i = 0; i < els.length; i++) {
+                    var t = (els[i].innerText || '').trim();
+                    if (t.length < 2 || t.length > 30) continue;
+                    if (els[i].children.length > 0) continue;
+                    if (t.match(/^[0-9a-f-]{8}/i)) continue;
+                    if (t.includes('/') || t.includes('@') || t.includes('ID')) continue;
+                    var ok = true;
+                    for (var j = 0; j < blacklist.length; j++) {
+                        if (t.indexOf(blacklist[j]) !== -1) { ok = false; break; }
                     }
+                    if (ok) return t;
                 }
                 return '';
             """)
@@ -352,7 +333,7 @@ def renew_server(sb, server_id: str) -> dict:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
-        # ── 处理 Turnstile（等待出现 + 等复选框就绪 + 点击）─
+        # ── 处理续期 Turnstile ───────────────────────────────
         handled = handle_renew_turnstile(sb, timeout_wait=15, timeout_token=90)
 
         print("⏳ 等待续期完成...")
@@ -363,7 +344,7 @@ def renew_server(sb, server_id: str) -> dict:
         time_after = read_remaining_time(sb)
         print(f"⏱ 续期后剩余时间：{time_after or '00:00:00'}")
 
-        # 如果时间还是 00:00:00，刷新再读一次
+        # 如果还是 00:00:00，刷新再读一次
         if not time_after or time_after == "00:00:00":
             print("🔄 刷新页面再确认...")
             sb.refresh()
@@ -372,19 +353,16 @@ def renew_server(sb, server_id: str) -> dict:
             print(f"⏱ 刷新后剩余时间：{time_after or '00:00:00'}")
 
         # ── 判断续期是否成功 ─────────────────────────────────
-        # 成功条件：续期后时间不为 00:00:00，且与续期前不同（或前后都为0但已操作）
         if time_after and time_after != "00:00:00":
             result["success"]   = True
             result["remaining"] = time_after
             print(f"🎉 续期成功！剩余时间：{time_after}")
+        elif handled:
+            result["success"]   = True
+            result["remaining"] = "（时间读取失败，但 Turnstile 已通过）"
+            print("⚠️ Turnstile 已通过，续期操作完成，但剩余时间读取为0，请手动确认")
         else:
-            # 时间仍为 0，但如果 Turnstile 通过了，标记为可能成功
-            if handled:
-                result["success"]   = True
-                result["remaining"] = time_after or "（读取失败）"
-                print(f"⚠️ 续期操作已完成（Turnstile已通过），但剩余时间读取为0，请手动确认")
-            else:
-                raise RuntimeError("续期后剩余时间仍为 00:00:00，续期可能未生效")
+            raise RuntimeError("续期后剩余时间仍为 00:00:00，续期可能未生效")
 
     except Exception as e:
         result["error"] = str(e)
