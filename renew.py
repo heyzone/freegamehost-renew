@@ -74,17 +74,14 @@ def nuke_ads(sb):
     try:
         sb.execute_script("""
             (function() {
-                // 移除固定定位的广告覆盖层
                 document.querySelectorAll('*').forEach(function(el) {
                     try {
                         var style = window.getComputedStyle(el);
                         var pos = style.position;
                         var zi = parseInt(style.zIndex) || 0;
-                        // 高 z-index 的 fixed/absolute 元素且不是 Turnstile 相关的
                         if ((pos === 'fixed' || pos === 'absolute') && zi > 100) {
                             var text = (el.innerText || '').toLowerCase();
                             var src = (el.querySelector('iframe') ? el.querySelector('iframe').src : '') || '';
-                            // 保留 Turnstile/CF 相关弹窗
                             if (text.indexOf('verify') !== -1 ||
                                 text.indexOf('cloudflare') !== -1 ||
                                 text.indexOf('human') !== -1 ||
@@ -93,7 +90,6 @@ def nuke_ads(sb):
                         }
                     } catch(e) {}
                 });
-                // 额外移除常见广告 class
                 var adSelectors = [
                     '[id*="google_ads"]', '[id*="ad-container"]',
                     '[class*="adsbygoogle"]', '[class*="ad-banner"]',
@@ -106,281 +102,134 @@ def nuke_ads(sb):
                 });
             })();
         """)
-        print("🚫 广告已清除")
-    except Exception as e:
-        print(f"⚠️ 广告清除异常: {e}")
+    except Exception:
+        pass
 
 # ── 等待 Turnstile Token ─────────────────────────────────────
 def wait_for_turnstile_token(sb, timeout=90):
-    print("📡 开始监控 Turnstile Token...")
     deadline = time.time() + timeout
     while time.time() < deadline:
-        # 方式1：主页面 input
         try:
             token = sb.execute_script("""
                 (function() {
                     var el = document.querySelector('[name="cf-turnstile-response"]');
-                    return el ? el.value : '';
+                    if (el && el.value.length > 20) return el.value;
+                    var iframes = document.querySelectorAll('iframe');
+                    for (var i = 0; i < iframes.length; i++) {
+                        try {
+                            var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
+                            var res = doc.querySelector('[name="cf-turnstile-response"]');
+                            if (res && res.value.length > 20) return res.value;
+                        } catch(e) {}
+                    }
+                    return '';
                 })();
             """)
-            if token and len(token) > 20:
-                print(f"✅ Cloudflare Turnstile 验证通过！token：{token[:60]}...")
+            if token:
+                print(f"✅ Cloudflare 验证通过！Token 长度: {len(token)}")
                 return token
         except Exception:
             pass
+        time.sleep(1.5)
+    return ""
 
-        # 方式2：遍历所有 iframe
-        try:
-            iframe_count = sb.execute_script(
-                "(function() { return document.querySelectorAll('iframe').length; })();"
-            )
-            for i in range(iframe_count):
-                try:
-                    token = sb.execute_script(f"""
-                        (function() {{
-                            try {{
-                                var iframe = document.querySelectorAll('iframe')[{i}];
-                                var doc = iframe.contentDocument || iframe.contentWindow.document;
-                                var el = doc.querySelector('[name="cf-turnstile-response"]');
-                                return el ? el.value : '';
-                            }} catch(e) {{ return ''; }}
-                        }})();
-                    """)
-                    if token and len(token) > 20:
-                        print(f"✅ Cloudflare Turnstile 验证通过（iframe[{i}]）！token：{token[:60]}...")
-                        return token
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        time.sleep(1)
-
-    raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
-
-# ── 找 Turnstile iframe（用内容检测，不依赖 src）────────────
+# ── 找 Turnstile iframe ─────────────────────────────────────
 def find_turnstile_iframe_index(sb):
     return sb.execute_script("""
         (function() {
             var iframes = document.querySelectorAll('iframe');
             for (var i = 0; i < iframes.length; i++) {
                 var src = iframes[i].src || '';
-                // 先用 src 判断
-                if (src.indexOf('cloudflare') !== -1 ||
-                    src.indexOf('turnstile') !== -1 ||
-                    src.indexOf('challenges') !== -1) {
-                    return i;
-                }
-                // 再用内容判断
+                if (src.indexOf('cloudflare') !== -1 || src.indexOf('challenges') !== -1) return i;
                 try {
                     var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
-                    if (!doc || !doc.body) continue;
-                    var text = doc.body.innerText || '';
-                    var html = doc.body.innerHTML || '';
-                    if (text.indexOf('Verify') !== -1 ||
-                        text.indexOf('Verifying') !== -1 ||
-                        html.indexOf('cf-turnstile') !== -1 ||
-                        html.indexOf('turnstile') !== -1 ||
-                        doc.querySelector('[name="cf-turnstile-response"]')) {
-                        return i;
-                    }
+                    if (doc.querySelector('[name="cf-turnstile-response"]') || doc.body.innerText.includes('Verify')) return i;
                 } catch(e) {}
             }
             return -1;
         })();
     """)
 
-# ── 等待并点击 Turnstile ─────────────────────────────────────
-def handle_turnstile(sb, timeout_wait=25, timeout_token=90):
-    print("⏳ 等待 Turnstile 验证组件出现...")
+# ── 增强型处理 Turnstile ─────────────────────────────────────
+def handle_turnstile(sb, timeout_wait=45):
+    print(f"⏳ 正在探测验证组件 (最长等待 {timeout_wait}s)...")
     deadline = time.time() + timeout_wait
-    iframe_idx = -1
-
+    
     while time.time() < deadline:
-        # 先清广告，每次循环都清
         nuke_ads(sb)
+        
+        # 1. 检查是否已经自动出 Token
+        if wait_for_turnstile_token(sb, timeout=1): return True
 
+        # 2. 探测 iframe
         idx = find_turnstile_iframe_index(sb)
         if idx >= 0:
-            iframe_idx = idx
-            print(f"✅ 验证组件就绪（iframe[{idx}]）")
-            break
-
-        # 同时检查是否已自动通过
-        try:
-            token = sb.execute_script("""
-                (function() {
-                    var el = document.querySelector('[name="cf-turnstile-response"]');
-                    return el ? el.value : '';
-                })();
+            print(f"✅ 捕获到验证组件 iframe[{idx}]")
+            
+            # 检查 Verifying 状态
+            is_verifying = sb.execute_script(f"""
+                (function() {{
+                    try {{
+                        var f = document.querySelectorAll('iframe')[{idx}];
+                        var doc = f.contentDocument || f.contentWindow.document;
+                        return doc.body.innerText.includes('Verifying');
+                    }} catch(e) {{ return false; }}
+                }})();
             """)
-            if token and len(token) > 20:
-                print(f"✅ Turnstile 已自动通过！token：{token[:60]}...")
-                return True
-        except Exception:
-            pass
+            
+            if not is_verifying:
+                print("☝️ 验证框处于可点击状态，尝试模拟交互...")
+                try:
+                    # 尝试切换进去点击 Mark 元素 (Turnstile 标准元素)
+                    sb.switch_to_frame(f"iframe:nth-of-type({idx + 1})")
+                    sb.click("span.mark", timeout=3)
+                    sb.switch_to_parent_frame()
+                except:
+                    sb.switch_to_parent_frame()
+                    # 备选：使用你原来的坐标点击逻辑逻辑
+                    rect = sb.execute_script(f"var r = document.querySelectorAll('iframe')[{idx}].getBoundingClientRect(); return {{x: r.left + 30, y: r.top + r.height/2}};")
+                    from selenium.webdriver.common.action_chains import ActionChains
+                    ActionChains(sb.driver).move_by_offset(rect["x"], rect["y"]).click().move_by_offset(-rect["x"], -rect["y"]).perform()
+            
+            # 点击后给一点缓冲再次检查 Token
+            if wait_for_turnstile_token(sb, timeout=15): return True
 
-        time.sleep(1)
-
-    if iframe_idx < 0:
-        print("ℹ️ 未检测到 Turnstile 验证组件")
-        return False
-
-    # 等 Verifying 状态结束（最多30s）
-    print("⏳ 等待 Verifying 状态结束...")
-    verifying_deadline = time.time() + 30
-    while time.time() < verifying_deadline:
-        # 检查是否已自动通过
-        try:
-            token = sb.execute_script("""
-                (function() {
-                    var el = document.querySelector('[name="cf-turnstile-response"]');
-                    return el ? el.value : '';
-                })();
-            """)
-            if token and len(token) > 20:
-                print(f"✅ Turnstile 已自动通过！token：{token[:60]}...")
-                return True
-        except Exception:
-            pass
-
-        still_verifying = sb.execute_script(f"""
-            (function() {{
-                try {{
-                    var iframe = document.querySelectorAll('iframe')[{iframe_idx}];
-                    var doc = iframe.contentDocument || iframe.contentWindow.document;
-                    var text = doc.body ? doc.body.innerText : '';
-                    return text.indexOf('Verifying') !== -1;
-                }} catch(e) {{ return false; }}
-            }})();
-        """)
-        if not still_verifying:
-            print("✅ Verifying 状态已结束，准备点击")
-            break
-        time.sleep(1)
-
-    # 再清一次广告再点击
-    nuke_ads(sb)
-    sb.sleep(0.5)
-
-    # 找到 iframe 元素并点击
-    try:
-        iframes = sb.find_elements("iframe")
-        if iframe_idx >= len(iframes):
-            print(f"⚠️ iframe 索引越界，尝试用第一个 iframe")
-            iframe_idx = 0
-        iframe_el = iframes[iframe_idx]
-
-        sb.execute_script(
-            "(function(el) { el.scrollIntoView({behavior: 'smooth', block: 'center'}); })(arguments[0]);",
-            iframe_el
-        )
-        sb.sleep(1)
-
-        rect = sb.execute_script(
-            "(function(el) { var r = el.getBoundingClientRect(); return {x: r.left + 20, y: r.top + r.height / 2}; })(arguments[0]);",
-            iframe_el
-        )
-        print(f"📐 坐标计算完成：x={rect['x']:.0f}, y={rect['y']:.0f}")
-
-        from selenium.webdriver.common.action_chains import ActionChains
-        ActionChains(sb.driver) \
-            .move_by_offset(rect["x"], rect["y"]) \
-            .click() \
-            .move_by_offset(-rect["x"], -rect["y"]) \
-            .perform()
-        print("📐 坐标点击成功")
-    except Exception as e:
-        print(f"⚠️ Turnstile 点击异常: {e}")
-
-    # 等待 token
-    wait_for_turnstile_token(sb, timeout=timeout_token)
-    return True
+        time.sleep(2)
+    
+    print("ℹ️ 未能完成验证，可能由于加载超时或无需验证")
+    return False
 
 # ── 点击 LOGIN 按钮 ──────────────────────────────────────────
 def click_login_button(sb):
     try:
         sb.click("//button[normalize-space(.)='LOGIN']", timeout=8, by="xpath")
         return
-    except Exception:
-        pass
-    try:
-        sb.click("//button[contains(.,'LOGIN') and not(contains(.,'Reload'))]",
-                 timeout=5, by="xpath")
-        return
-    except Exception:
-        pass
-    try:
-        sb.click("button[type='submit']:last-of-type", timeout=5)
-        return
-    except Exception:
-        pass
-    sb.execute_script("""
-        (function() {
-            var btns = document.querySelectorAll('button[type="submit"]');
-            if (btns.length > 0) btns[btns.length - 1].click();
-        })();
-    """)
+    except: pass
+    sb.execute_script("var b = document.querySelectorAll('button[type=\"submit\"]'); if(b.length) b[b.length-1].click();")
 
 # ── 浏览器登录 ───────────────────────────────────────────────
 def browser_login(sb, email: str, password: str):
     print("🔑 打开登录页面...")
     sb.open(LOGIN_URL)
     sb.sleep(5)
-    sb.save_screenshot("login_page.png")
+    
+    # 登录页前置过盾
+    handle_turnstile(sb, timeout_wait=15)
 
     print("✏️ 填写账号密码...")
-    try:
-        sb.wait_for_element_present("input", timeout=15)
-        email_js    = email.replace("\\", "\\\\").replace("'", "\\'")
-        password_js = password.replace("\\", "\\\\").replace("'", "\\'")
-        sb.execute_script(f"""
-            (function() {{
-                var inputs = document.querySelectorAll('input');
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                ).set;
-                setter.call(inputs[0], '{email_js}');
-                inputs[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
-                setter.call(inputs[1], '{password_js}');
-                inputs[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
-            }})();
-        """)
-        sb.sleep(0.5)
-        print("✅ 账号密码填写完成")
-    except Exception as e:
-        sb.save_screenshot("input_error.png")
-        raise RuntimeError(f"填写表单失败: {e}")
-
-    sb.save_screenshot("before_submit.png")
-
-    # 检查登录页是否有 Turnstile
-    idx = find_turnstile_iframe_index(sb)
-    if idx >= 0:
-        print("🛡️ 登录页检测到 Turnstile，等待验证...")
-        handle_turnstile(sb, timeout_wait=30, timeout_token=90)
-
-    print("📤 提交登录请求...")
+    sb.type('input[type="email"]', email)
+    sb.type('input[type="password"]', password)
+    sb.sleep(1)
+    
+    print("📤 提交登录...")
     click_login_button(sb)
-
-    print("⏳ 等待登录跳转...")
     sb.sleep(10)
-    sb.save_screenshot("after_login.png")
 
-    current = sb.get_current_url()
-    print(f"🔁 登录后URL：{current}")
-
-    if "login" in current.lower():
-        print("⏳ 仍在登录页，再等 10s...")
-        sb.sleep(10)
-        sb.save_screenshot("after_login2.png")
-        current = sb.get_current_url()
-
-    if "login" in current.lower():
-        sb.save_screenshot("login_failed.png")
-        raise RuntimeError(f"❌ 登录失败，仍在登录页：{current}")
-
-    print(f"✅ 登录成功！当前页面：{current}")
+    if "login" in sb.get_current_url().lower():
+        print("🛡️ 登录后仍在原页面，尝试再次处理验证...")
+        handle_turnstile(sb, timeout_wait=10)
+        click_login_button(sb)
+        sb.sleep(8)
 
 # ── 单服务器续期 ─────────────────────────────────────────────
 def renew_server(sb, server_id: str) -> dict:
@@ -389,217 +238,92 @@ def renew_server(sb, server_id: str) -> dict:
     try:
         print(f"🔗 导航到服务器页面：{server_url}")
         sb.open(server_url)
-        print("⏳ 等待服务器页面加载...")
         sb.wait_for_element_present("body", timeout=20)
         sb.sleep(3)
         nuke_ads(sb)
-        sb.sleep(1)
-        print("✅ 服务器页面加载完成")
-        sb.save_screenshot(f"loaded_{server_id}.png")
-
-        # ── 读取服务器名称 ───────────────────────────────────
-        print("🔍 读取服务器名称...")
-        name = sb.execute_script("""
-            (function() {
-                var allEls = document.querySelectorAll('*');
-                for (var i = 0; i < allEls.length; i++) {
-                    var t = (allEls[i].innerText || '').trim();
-                    if (t.indexOf('ID:') === 0 && t.length < 30) {
-                        var parent = allEls[i].parentElement;
-                        if (parent) {
-                            var children = Array.from(parent.children);
-                            var idx = children.indexOf(allEls[i]);
-                            if (idx > 0) {
-                                var n = (children[idx - 1].innerText || '').trim();
-                                if (n && n.length < 50) return n;
-                            }
-                            var prev = parent.previousElementSibling;
-                            if (prev) {
-                                var n = (prev.innerText || '').trim().split('\\n')[0];
-                                if (n && n.length < 50 && n.indexOf('/') === -1) return n;
-                            }
-                        }
-                    }
-                }
-                return '';
-            })();
-        """)
-        if not name:
-            name = sb.execute_script("""
-                (function() {
-                    var blacklist = ['Dashboard','Account','Console','Files','Sign','Upgrade',
-                        'Ad ','Block','Detect','FreeGame','Premium','Reload','Online','Offline'];
-                    var els = document.querySelectorAll('span,p,div,h1,h2,h3,h4');
-                    for (var i = 0; i < els.length; i++) {
-                        var t = (els[i].innerText || '').trim();
-                        if (t.length < 2 || t.length > 30) continue;
-                        if (els[i].children.length > 0) continue;
-                        if (/^[0-9a-f-]{8}/i.test(t)) continue;
-                        if (t.indexOf('/') !== -1 || t.indexOf('@') !== -1 || t.indexOf('ID') !== -1) continue;
-                        var ok = true;
-                        for (var j = 0; j < blacklist.length; j++) {
-                            if (t.indexOf(blacklist[j]) !== -1) { ok = false; break; }
-                        }
-                        if (ok) return t;
-                    }
-                    return '';
-                })();
-            """)
-        result["name"] = name or server_id
-        print(f"🖥 服务器名称：{result['name']}")
-
-        # ── 续期前读取剩余时间 ───────────────────────────────
+        
+        # 读取名称和旧时间
         time_before = read_remaining_time(sb)
         print(f"⏱ 续期前剩余时间：{time_before or '00:00:00'}")
 
-        print("🔄 开始执行续期流程...")
-        print("📡 开始监控 Turnstile Token...")
-
-        # 点击 +8 HOURS 按钮
-        renew_btn_xpaths = [
-            "//button[contains(., '+8 HOURS')]",
-            "//button[contains(., '+8 Hours')]",
-            "//button[contains(., '+8 hours')]",
-            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), '+8 HOURS')]",
-            "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), '+8 HOURS')]",
-        ]
+        # 续期按钮 XPATH 列表
+        renew_btn_xpaths = ["//button[contains(., '+8')]", "//button[contains(translate(., 'h', 'H'), '+8 HOURS')]"]
         clicked = False
         for xpath in renew_btn_xpaths:
             try:
                 sb.click(xpath, timeout=5, by="xpath")
-                print(f"🔄 +8 HOURS 续期按钮已点击")
                 clicked = True
+                print("🔄 +8 HOURS 续期按钮已点击")
                 break
-            except Exception:
-                continue
+            except: continue
 
         if not clicked:
-            sb.save_screenshot(f"no_renew_btn_{server_id}.png")
-            raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
+            raise RuntimeError("找不到续期按钮")
 
-        print("⏳ 等待 Turnstile 验证组件...")
-        sb.sleep(2)
-        sb.save_screenshot(f"after_click_renew_{server_id}.png")
-
-        # ── 处理 Turnstile ───────────────────────────────────
-        handled = handle_turnstile(sb, timeout_wait=25, timeout_token=90)
-
-        print("⏳ 等待续期完成...")
+        # 【核心改进】给验证码生成留出充足时间
+        print("⏱ 等待验证组件异步加载 (5s)...")
         sb.sleep(5)
-        sb.save_screenshot(f"after_renew_{server_id}.png")
+        sb.save_screenshot(f"before_verify_{server_id}.png")
 
-        # ── 续期后读取剩余时间 ───────────────────────────────
+        # 处理验证
+        handle_turnstile(sb)
+
+        print("⏳ 等待服务端状态更新 (8s)...")
+        sb.sleep(8)
+        sb.save_screenshot(f"after_verify_{server_id}.png")
+
+        # 确认结果
         time_after = read_remaining_time(sb)
-        print(f"⏱ 续期后剩余时间：{time_after or '00:00:00'}")
-
         if not time_after or time_after == "00:00:00":
-            print("🔄 刷新页面再确认...")
             sb.refresh()
-            sb.sleep(3)
+            sb.sleep(5)
             time_after = read_remaining_time(sb)
-            print(f"⏱ 刷新后剩余时间：{time_after or '00:00:00'}")
 
-        if time_after and time_after != "00:00:00":
-            result["success"]   = True
+        if time_after and time_after != "00:00:00" and time_after != time_before:
+            result["success"] = True
             result["remaining"] = time_after
             print(f"🎉 续期成功！剩余时间：{time_after}")
-        elif handled:
-            result["success"]   = True
-            result["remaining"] = "（时间读取失败，但 Turnstile 已通过）"
-            print("⚠️ Turnstile 已通过，续期操作完成，但剩余时间读取为0，请手动确认")
         else:
-            raise RuntimeError("续期后剩余时间仍为 00:00:00，续期可能未生效")
+            raise RuntimeError(f"续期未生效，当前时间：{time_after}")
 
     except Exception as e:
         result["error"] = str(e)
         print(f"❌ 续期失败 [{server_id}]: {e}")
-        try:
-            sb.save_screenshot(f"error_{server_id}.png")
-        except Exception:
-            pass
+        sb.save_screenshot(f"error_{server_id}.png")
 
     return result
 
 # ── 单账号主流程 ─────────────────────────────────────────────
 def process_account(account: dict):
-    email      = account["email"]
-    password   = account["password"]
-    server_ids = account["server_ids"]
-
     proxy_str = "http://127.0.0.1:8080" if GOST_PROXY else None
-
-    print("🌐 验证出口IP...")
-    try:
-        proxies   = {"http": proxy_str, "https": proxy_str} if proxy_str else {}
-        raw_ip    = requests.get("https://api.ipify.org", proxies=proxies, timeout=10).text.strip()
-        ip_masked = ".".join(raw_ip.split(".")[:3]) + ".xx"
-        print(f"✅ 出口IP确认：{ip_masked}")
-    except Exception as e:
-        print(f"⚠️ 出口IP验证失败: {e}，继续...")
-
-    sb_kwargs = dict(uc=True, headless=False)
-    if proxy_str:
-        sb_kwargs["proxy"] = proxy_str
-
     results = []
-    with SB(**sb_kwargs) as sb:
-        print("🔧 启动浏览器...")
-        print("🚀 浏览器就绪！")
-
-        browser_login(sb, email, password)
-
-        for sid in server_ids:
-            r = renew_server(sb, sid)
-            results.append(r)
+    
+    # 保持 UC 模式，这对过 Cloudflare 至关重要
+    with SB(uc=True, headless=True, proxy=proxy_str) as sb:
+        browser_login(sb, account["email"], account["password"])
+        for sid in account["server_ids"]:
+            results.append(renew_server(sb, sid))
             sb.sleep(2)
-
     return results
 
-# ── 汇总推送 ─────────────────────────────────────────────────
+# ── 推送及入口保持不变 ────────────────────────────────────────
 def build_tg_message(all_results: list) -> str:
     lines = ["<b>🎮 FGH 续期报告</b>"]
     for r in all_results:
-        status = "✅" if r["success"] else "❌"
-        line   = f'{status} <b>{r["name"]}</b> (<code>{r["server_id"]}</code>)'
-        if r["success"] and r["remaining"]:
-            line += f'\n   ⏱ 剩余：{r["remaining"]}'
-        elif not r["success"]:
-            line += f'\n   ⚠️ {r["error"][:80]}'
-        lines.append(line)
+        status = "✅" if r.get("success") else "❌"
+        lines.append(f'{status} <b>{r.get("name")}</b> ({r.get("server_id")})\n   ⏱ 剩余：{r.get("remaining") or "N/A"}')
     return "\n".join(lines)
 
-# ── 入口 ─────────────────────────────────────────────────────
 def main():
     accounts = parse_accounts()
-    if not accounts:
-        print("❌ 未找到有效账号，请检查 FGH_ACCOUNT 环境变量")
-        return
-
+    if not accounts: return
     all_results = []
     for acc in accounts:
-        print(f"\n{'='*50}")
-        print(f"👤 处理账号：{acc['email']}")
-        print(f"{'='*50}")
         try:
-            results = process_account(acc)
-            all_results.extend(results)
+            all_results.extend(process_account(acc))
         except Exception as e:
-            print(f"❌ 账号 {acc['email']} 处理失败: {e}")
-            all_results.append({
-                "server_id": ",".join(acc["server_ids"]),
-                "name":      acc["email"],
-                "success":   False,
-                "remaining": "",
-                "error":     str(e),
-            })
-
-    msg = build_tg_message(all_results)
-    tg_send(msg)
-
-    success_count = sum(1 for r in all_results if r["success"])
-    total_count   = len(all_results)
-    print(f"\n🏁 完成：{success_count}/{total_count} 台服务器续期成功")
-
+            all_results.append({"server_id": "ACC", "name": acc["email"], "success": False, "error": str(e)})
+    tg_send(build_tg_message(all_results))
 
 if __name__ == "__main__":
     main()
