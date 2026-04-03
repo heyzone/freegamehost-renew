@@ -69,7 +69,7 @@ def read_remaining_time(sb):
 
 # ── 等待 Turnstile 复选框就绪并点击 ─────────────────────────
 def wait_and_click_turnstile(sb, timeout=30):
-    print("⏳ 等待 Turnstile 复选框就绪（跳过 Verifying 状态）...")
+    print("⏳ 等待 Turnstile 复选框就绪...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         is_ready = sb.execute_script("""
@@ -145,7 +145,7 @@ def wait_for_turnstile_token(sb, timeout=90):
         time.sleep(1)
     raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
-# ── 处理续期页 Turnstile（等出现 + 等复选框 + 等token）──────
+# ── 处理续期页 Turnstile ─────────────────────────────────────
 def handle_renew_turnstile(sb, timeout_wait=15, timeout_token=90):
     print("⏳ 等待 Turnstile 验证组件出现...")
     deadline = time.time() + timeout_wait
@@ -168,7 +168,7 @@ def handle_renew_turnstile(sb, timeout_wait=15, timeout_token=90):
     wait_for_turnstile_token(sb, timeout=timeout_token)
     return True
 
-# ── 浏览器登录（保持与上一个成功版本一致）───────────────────
+# ── 浏览器登录 ───────────────────────────────────────────────
 def browser_login(sb, email: str, password: str):
     print("🔑 打开登录页面...")
     sb.open(LOGIN_URL)
@@ -198,7 +198,7 @@ def browser_login(sb, email: str, password: str):
 
     sb.save_screenshot("before_submit.png")
 
-    # 检查是否有 Turnstile（登录页通常没有，直接提交）
+    # 检查是否有 Turnstile
     has_turnstile = sb.execute_script(
         "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
     )
@@ -207,21 +207,40 @@ def browser_login(sb, email: str, password: str):
         wait_and_click_turnstile(sb, timeout=30)
         wait_for_turnstile_token(sb, timeout=90)
 
-    # 多等 3s 让 reCAPTCHA v3 隐式完成，再提交
-    print("⏳ 等待页面验证组件就绪（3s）...")
-    sb.sleep(3)
+    # 打印当前所有按钮，便于调试
+    btns = sb.execute_script("""
+        var result = [];
+        document.querySelectorAll('button').forEach(function(el) {
+            result.push({text: (el.innerText||'').trim(), type: el.type, disabled: el.disabled});
+        });
+        return result;
+    """)
+    print(f"🔍 登录页按钮：{btns}")
 
     print("📤 提交登录请求...")
-    try:
-        sb.click(
-            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LOGIN')]",
-            timeout=10, by="xpath"
-        )
-    except Exception:
+    # 方式1：JS 直接点击 LOGIN 按钮（最可靠）
+    clicked = sb.execute_script("""
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            var t = (btns[i].innerText || '').trim().toUpperCase();
+            if (t === 'LOGIN' || t.indexOf('LOGIN') !== -1) {
+                btns[i].click();
+                return true;
+            }
+        }
+        return false;
+    """)
+    if not clicked:
+        # 方式2：点第一个 submit 按钮
         try:
             sb.click("button[type='submit']", timeout=5)
+            clicked = True
         except Exception:
-            sb.execute_script("document.querySelector('button').click();")
+            pass
+    if not clicked:
+        # 方式3：点第一个 button
+        sb.execute_script("document.querySelector('button').click();")
+    print("✅ 登录按钮已点击")
 
     print("⏳ 等待登录跳转...")
     sb.sleep(8)
@@ -231,6 +250,26 @@ def browser_login(sb, email: str, password: str):
     print(f"🔁 登录后URL：{current}")
 
     if "login" in current.lower():
+        # 截图看页面是否有错误提示
+        err_msg = sb.execute_script("""
+            var els = document.querySelectorAll('*');
+            for (var i = 0; i < els.length; i++) {
+                var t = (els[i].innerText || '').trim();
+                if (t && t.length < 200 && (
+                    t.toLowerCase().includes('invalid') ||
+                    t.toLowerCase().includes('incorrect') ||
+                    t.toLowerCase().includes('error') ||
+                    t.toLowerCase().includes('wrong') ||
+                    t.toLowerCase().includes('fail')
+                ) && els[i].children.length === 0) {
+                    return t;
+                }
+            }
+            return '';
+        """)
+        if err_msg:
+            print(f"⚠️ 页面错误提示：{err_msg}")
+
         print("⏳ 仍在登录页，再等 10s...")
         sb.sleep(10)
         sb.save_screenshot("after_login2.png")
@@ -256,7 +295,7 @@ def renew_server(sb, server_id: str) -> dict:
 
         sb.save_screenshot(f"loaded_{server_id}.png")
 
-        # ── 读取服务器名称（侧边栏 kv1 在 ID: 上方）────────
+        # ── 读取服务器名称 ───────────────────────────────────
         print("🔍 读取服务器名称...")
         name = sb.execute_script("""
             var allEls = document.querySelectorAll('*');
@@ -268,8 +307,7 @@ def renew_server(sb, server_id: str) -> dict:
                         var children = Array.from(parent.children);
                         var idx = children.indexOf(allEls[i]);
                         if (idx > 0) {
-                            var nameEl = children[idx - 1];
-                            var n = (nameEl.innerText || '').trim();
+                            var n = (children[idx - 1].innerText || '').trim();
                             if (n && n.length < 50) return n;
                         }
                         var prev = parent.previousElementSibling;
@@ -283,10 +321,10 @@ def renew_server(sb, server_id: str) -> dict:
             return '';
         """)
         if not name:
-            # 备用：过滤干扰词，找短文本
+            blacklist = ['Dashboard','Account','Console','Files','Sign','Upgrade',
+                         'Ad ','Block','Detect','FreeGame','Premium','Reload','Online','Offline']
             name = sb.execute_script("""
-                var blacklist = ['Dashboard','Account','Console','Files','Sign','Upgrade',
-                    'Ad ','Block','Detect','FreeGame','Premium','Reload','Online','Offline'];
+                var blacklist = arguments[0];
                 var els = document.querySelectorAll('span,p,div,h1,h2,h3,h4');
                 for (var i = 0; i < els.length; i++) {
                     var t = (els[i].innerText || '').trim();
@@ -301,7 +339,7 @@ def renew_server(sb, server_id: str) -> dict:
                     if (ok) return t;
                 }
                 return '';
-            """)
+            """, blacklist)
         result["name"] = name or server_id
         print(f"🖥 服务器名称：{result['name']}")
 
@@ -344,7 +382,6 @@ def renew_server(sb, server_id: str) -> dict:
         time_after = read_remaining_time(sb)
         print(f"⏱ 续期后剩余时间：{time_after or '00:00:00'}")
 
-        # 如果还是 00:00:00，刷新再读一次
         if not time_after or time_after == "00:00:00":
             print("🔄 刷新页面再确认...")
             sb.refresh()
@@ -352,7 +389,6 @@ def renew_server(sb, server_id: str) -> dict:
             time_after = read_remaining_time(sb)
             print(f"⏱ 刷新后剩余时间：{time_after or '00:00:00'}")
 
-        # ── 判断续期是否成功 ─────────────────────────────────
         if time_after and time_after != "00:00:00":
             result["success"]   = True
             result["remaining"] = time_after
