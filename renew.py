@@ -69,65 +69,51 @@ def read_remaining_time(sb):
         pass
     return ""
 
-# ── 等待 Turnstile 复选框就绪并点击 ─────────────────────────
-def wait_and_click_turnstile(sb, timeout=30):
-    print("⏳ 等待 Turnstile 复选框就绪...")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        is_ready = sb.execute_script("""
-            (function() {
-                var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                if (!iframe) return false;
-                try {
-                    var doc = iframe.contentDocument || iframe.contentWindow.document;
-                    var cb = doc.querySelector('input[type="checkbox"]');
-                    var label = doc.querySelector('.ctp-checkbox-label');
-                    return !!(cb || label);
-                } catch(e) { return false; }
-            })();
-        """)
-        if is_ready:
-            print("✅ Turnstile 复选框已就绪，开始点击...")
-            break
-        time.sleep(1)
-
+# ── 关闭广告弹窗 ─────────────────────────────────────────────
+def close_ads(sb):
     try:
         sb.execute_script("""
             (function() {
-                var iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                if (iframe) { iframe.scrollIntoView({behavior: 'smooth', block: 'center'}); }
+                // 关闭常见广告容器
+                var selectors = [
+                    '[class*="ad-"]', '[class*="ads-"]', '[id*="ad-"]',
+                    '[class*="popup"]', '[class*="modal"]:not([class*="renew"])',
+                    '[class*="banner"]', '[class*="overlay"]'
+                ];
+                selectors.forEach(function(sel) {
+                    try {
+                        document.querySelectorAll(sel).forEach(function(el) {
+                            if (el.style) el.style.display = 'none';
+                        });
+                    } catch(e) {}
+                });
             })();
         """)
-        sb.sleep(0.5)
-        iframe_el = sb.find_element("iframe[src*='challenges.cloudflare.com']")
-        rect = sb.execute_script(
-            "(function(el) { var r = el.getBoundingClientRect(); return {x: r.left + 20, y: r.top + r.height / 2}; })(arguments[0]);",
-            iframe_el
-        )
-        from selenium.webdriver.common.action_chains import ActionChains
-        ActionChains(sb.driver) \
-            .move_by_offset(rect["x"], rect["y"]) \
-            .click() \
-            .move_by_offset(-rect["x"], -rect["y"]) \
-            .perform()
-        print("📐 Turnstile 复选框点击完成")
-    except Exception as e:
-        print(f"⚠️ Turnstile 点击异常: {e}")
+    except Exception:
+        pass
 
-# ── 等待 Turnstile Token ─────────────────────────────────────
+# ── 通用：等待并获取 Turnstile Token ────────────────────────
+# 放宽 iframe src 匹配，支持所有 cloudflare 相关 iframe
 def wait_for_turnstile_token(sb, timeout=90):
     print("📡 开始监控 Turnstile Token...")
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # 方式1：主页面隐藏 input
         try:
-            token = sb.execute_script(
-                "(function() { return document.querySelector('[name=\"cf-turnstile-response\"]')?.value || ''; })();"
-            )
+            token = sb.execute_script("""
+                (function() {
+                    return document.querySelector('[name="cf-turnstile-response"]')
+                        ? document.querySelector('[name="cf-turnstile-response"]').value
+                        : '';
+                })();
+            """)
             if token and len(token) > 20:
-                print(f"✅ Cloudflare Turnstile 验证通过！token：{token[:60]}...")
+                print(f"✅ Turnstile Token 获取成功（主页面）：{token[:60]}...")
                 return token
         except Exception:
             pass
+
+        # 方式2：遍历所有 iframe（不限制 src，全部扫）
         try:
             iframe_count = sb.execute_script(
                 "(function() { return document.querySelectorAll('iframe').length; })();"
@@ -145,37 +131,125 @@ def wait_for_turnstile_token(sb, timeout=90):
                         }})();
                     """)
                     if token and len(token) > 20:
-                        print(f"✅ Cloudflare Turnstile 验证通过（iframe[{i}]）！token：{token[:60]}...")
+                        print(f"✅ Turnstile Token 获取成功（iframe[{i}]）：{token[:60]}...")
                         return token
                 except Exception:
                     pass
         except Exception:
             pass
+
         time.sleep(1)
+
     raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
-# ── 处理续期页 Turnstile ─────────────────────────────────────
-def handle_renew_turnstile(sb, timeout_wait=15, timeout_token=90):
+# ── 检测 Turnstile iframe（放宽匹配）────────────────────────
+def find_turnstile_iframe(sb):
+    return sb.execute_script("""
+        (function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+                var src = iframes[i].src || '';
+                if (src.indexOf('cloudflare') !== -1 ||
+                    src.indexOf('turnstile') !== -1 ||
+                    src.indexOf('challenges') !== -1) {
+                    return i;
+                }
+            }
+            // 没有匹配src，检查是否有 cf-turnstile-response input
+            if (document.querySelector('[name="cf-turnstile-response"]')) return -2;
+            return -1;
+        })();
+    """)
+
+# ── 点击 Turnstile iframe ────────────────────────────────────
+def click_turnstile_iframe(sb, iframe_index):
+    try:
+        if iframe_index >= 0:
+            iframe_el = sb.execute_script(
+                f"(function() {{ return document.querySelectorAll('iframe')[{iframe_index}]; }})();"
+            )
+            # 用 find_element 重新找
+            iframes = sb.find_elements("iframe")
+            if iframe_index < len(iframes):
+                iframe_el = iframes[iframe_index]
+            else:
+                iframe_el = sb.find_element("iframe")
+        else:
+            # -2 情况：直接有 input，不需要点 iframe
+            print("📐 Turnstile input 已存在，无需点击 iframe")
+            return
+
+        sb.execute_script(
+            "(function(el) { el.scrollIntoView({behavior: 'smooth', block: 'center'}); })(arguments[0]);",
+            iframe_el
+        )
+        sb.sleep(1)
+
+        rect = sb.execute_script(
+            "(function(el) { var r = el.getBoundingClientRect(); return {x: r.left + 20, y: r.top + r.height / 2}; })(arguments[0]);",
+            iframe_el
+        )
+        print(f"📐 坐标计算完成：x={rect['x']:.0f}, y={rect['y']:.0f}")
+
+        from selenium.webdriver.common.action_chains import ActionChains
+        ActionChains(sb.driver) \
+            .move_by_offset(rect["x"], rect["y"]) \
+            .click() \
+            .move_by_offset(-rect["x"], -rect["y"]) \
+            .perform()
+        print("📐 坐标点击成功")
+    except Exception as e:
+        print(f"⚠️ Turnstile iframe 点击异常: {e}")
+
+# ── 等待 Turnstile 出现并处理 ────────────────────────────────
+def handle_turnstile(sb, timeout_wait=15, timeout_token=90):
     print("⏳ 等待 Turnstile 验证组件出现...")
     deadline = time.time() + timeout_wait
-    appeared = False
+    iframe_idx = -1
     while time.time() < deadline:
-        has = sb.execute_script(
-            "(function() { return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]'); })();"
-        )
-        if has:
-            appeared = True
-            print("✅ Turnstile 验证组件已出现")
+        idx = find_turnstile_iframe(sb)
+        if idx != -1:
+            iframe_idx = idx
+            if idx == -2:
+                print("✅ 检测到 Turnstile input（无需点击 iframe）")
+            else:
+                print(f"✅ 验证组件就绪（iframe[{idx}]）")
             break
         time.sleep(1)
 
-    if not appeared:
-        print("ℹ️ 无需 Turnstile 验证")
+    if iframe_idx == -1:
+        print("ℹ️ 未检测到 Turnstile 验证组件")
         return False
 
-    wait_and_click_turnstile(sb, timeout=30)
+    print("📐 坐标计算完成")
+    click_turnstile_iframe(sb, iframe_idx)
     wait_for_turnstile_token(sb, timeout=timeout_token)
     return True
+
+# ── 点击 LOGIN 按钮 ──────────────────────────────────────────
+def click_login_button(sb):
+    try:
+        sb.click("//button[normalize-space(.)='LOGIN']", timeout=8, by="xpath")
+        return
+    except Exception:
+        pass
+    try:
+        sb.click("//button[contains(.,'LOGIN') and not(contains(.,'Reload'))]",
+                 timeout=5, by="xpath")
+        return
+    except Exception:
+        pass
+    try:
+        sb.click("button[type='submit']:last-of-type", timeout=5)
+        return
+    except Exception:
+        pass
+    sb.execute_script("""
+        (function() {
+            var btns = document.querySelectorAll('button[type="submit"]');
+            if (btns.length > 0) btns[btns.length - 1].click();
+        })();
+    """)
 
 # ── 浏览器登录 ───────────────────────────────────────────────
 def browser_login(sb, email: str, password: str):
@@ -209,39 +283,15 @@ def browser_login(sb, email: str, password: str):
 
     sb.save_screenshot("before_submit.png")
 
-    # 检查是否有 Turnstile
-    has_turnstile = sb.execute_script(
-        "(function() { return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]'); })();"
-    )
-    if has_turnstile:
+    # 检查登录页是否有 Turnstile
+    idx = find_turnstile_iframe(sb)
+    if idx != -1:
         print("🛡️ 登录页检测到 Turnstile，等待验证...")
-        wait_and_click_turnstile(sb, timeout=30)
+        click_turnstile_iframe(sb, idx)
         wait_for_turnstile_token(sb, timeout=90)
 
     print("📤 提交登录请求...")
-    # 用 SeleniumBase 原生 click 点击 LOGIN 按钮（日志已确认按钮存在）
-    try:
-        # 按文字找 button，排除 Reload Page
-        sb.click("//button[normalize-space(.)='LOGIN']", timeout=8, by="xpath")
-        print("✅ LOGIN 按钮点击成功（xpath normalize-space）")
-    except Exception:
-        try:
-            sb.click("//button[contains(.,'LOGIN') and not(contains(.,'Reload'))]",
-                     timeout=5, by="xpath")
-            print("✅ LOGIN 按钮点击成功（xpath contains）")
-        except Exception:
-            try:
-                sb.click("button[type='submit']:last-of-type", timeout=5)
-                print("✅ LOGIN 按钮点击成功（css last-of-type）")
-            except Exception:
-                # 最后备用：找所有 submit 按钮，点最后一个（LOGIN 在 Reload Page 后面）
-                sb.execute_script("""
-                    (function() {
-                        var btns = document.querySelectorAll('button[type="submit"]');
-                        if (btns.length > 0) btns[btns.length - 1].click();
-                    })();
-                """)
-                print("✅ LOGIN 按钮点击成功（js last submit）")
+    click_login_button(sb)
 
     print("⏳ 等待登录跳转...")
     sb.sleep(10)
@@ -251,28 +301,6 @@ def browser_login(sb, email: str, password: str):
     print(f"🔁 登录后URL：{current}")
 
     if "login" in current.lower():
-        # 读取页面错误提示
-        try:
-            err_msg = sb.execute_script("""
-                (function() {
-                    var els = document.querySelectorAll('*');
-                    for (var i = 0; i < els.length; i++) {
-                        var t = (els[i].innerText || '').trim();
-                        if (t && t.length < 200 && els[i].children.length === 0 && (
-                            t.toLowerCase().indexOf('invalid') !== -1 ||
-                            t.toLowerCase().indexOf('incorrect') !== -1 ||
-                            t.toLowerCase().indexOf('error') !== -1 ||
-                            t.toLowerCase().indexOf('wrong') !== -1
-                        )) return t;
-                    }
-                    return '';
-                })();
-            """)
-            if err_msg:
-                print(f"⚠️ 页面错误提示：{err_msg}")
-        except Exception:
-            pass
-
         print("⏳ 仍在登录页，再等 10s...")
         sb.sleep(10)
         sb.save_screenshot("after_login2.png")
@@ -294,6 +322,10 @@ def renew_server(sb, server_id: str) -> dict:
         print("⏳ 等待服务器页面加载...")
         sb.wait_for_element_present("body", timeout=20)
         sb.sleep(3)
+
+        # 关闭广告弹窗
+        close_ads(sb)
+        sb.sleep(1)
         print("✅ 服务器页面加载完成")
 
         sb.save_screenshot(f"loaded_{server_id}.png")
@@ -354,6 +386,7 @@ def renew_server(sb, server_id: str) -> dict:
         print(f"⏱ 续期前剩余时间：{time_before or '00:00:00'}")
 
         print("🔄 开始执行续期流程...")
+        print("📡 开始监控 Turnstile Token...")
 
         # 点击 +8 HOURS 按钮
         renew_btn_xpaths = [
@@ -377,8 +410,12 @@ def renew_server(sb, server_id: str) -> dict:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
+        print("⏳ 等待 Turnstile 验证组件...")
+        sb.sleep(2)
+        sb.save_screenshot(f"after_click_renew_{server_id}.png")
+
         # ── 处理续期 Turnstile ───────────────────────────────
-        handled = handle_renew_turnstile(sb, timeout_wait=15, timeout_token=90)
+        handled = handle_turnstile(sb, timeout_wait=20, timeout_token=90)
 
         print("⏳ 等待续期完成...")
         sb.sleep(5)
