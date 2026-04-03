@@ -69,27 +69,46 @@ def read_remaining_time(sb):
         pass
     return ""
 
-# ── 关闭广告弹窗 ─────────────────────────────────────────────
-def close_ads(sb):
+# ── 强力清除广告 ─────────────────────────────────────────────
+def nuke_ads(sb):
     try:
         sb.execute_script("""
             (function() {
-                var selectors = [
-                    '[class*="ad-"]', '[class*="ads-"]', '[id*="ad-"]',
-                    '[class*="popup"]', '[class*="banner"]', '[class*="overlay"]'
-                ];
-                selectors.forEach(function(sel) {
+                // 移除固定定位的广告覆盖层
+                document.querySelectorAll('*').forEach(function(el) {
                     try {
-                        document.querySelectorAll(sel).forEach(function(el) {
-                            if (el.style) el.style.display = 'none';
-                        });
+                        var style = window.getComputedStyle(el);
+                        var pos = style.position;
+                        var zi = parseInt(style.zIndex) || 0;
+                        // 高 z-index 的 fixed/absolute 元素且不是 Turnstile 相关的
+                        if ((pos === 'fixed' || pos === 'absolute') && zi > 100) {
+                            var text = (el.innerText || '').toLowerCase();
+                            var src = (el.querySelector('iframe') ? el.querySelector('iframe').src : '') || '';
+                            // 保留 Turnstile/CF 相关弹窗
+                            if (text.indexOf('verify') !== -1 ||
+                                text.indexOf('cloudflare') !== -1 ||
+                                text.indexOf('human') !== -1 ||
+                                src.indexOf('cloudflare') !== -1) return;
+                            el.style.display = 'none';
+                        }
                     } catch(e) {}
+                });
+                // 额外移除常见广告 class
+                var adSelectors = [
+                    '[id*="google_ads"]', '[id*="ad-container"]',
+                    '[class*="adsbygoogle"]', '[class*="ad-banner"]',
+                    'ins.adsbygoogle', '[data-ad-slot]'
+                ];
+                adSelectors.forEach(function(sel) {
+                    document.querySelectorAll(sel).forEach(function(el) {
+                        el.style.display = 'none';
+                    });
                 });
             })();
         """)
-        print("🚫 广告弹窗已关闭")
-    except Exception:
-        pass
+        print("🚫 广告已清除")
+    except Exception as e:
+        print(f"⚠️ 广告清除异常: {e}")
 
 # ── 等待 Turnstile Token ─────────────────────────────────────
 def wait_for_turnstile_token(sb, timeout=90):
@@ -139,37 +158,55 @@ def wait_for_turnstile_token(sb, timeout=90):
 
     raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
-# ── 找到 Turnstile iframe 并点击 ────────────────────────────
-def find_and_click_turnstile(sb, timeout_wait=20):
-    print("⏳ 等待 Turnstile iframe 出现...")
+# ── 找 Turnstile iframe（用内容检测，不依赖 src）────────────
+def find_turnstile_iframe_index(sb):
+    return sb.execute_script("""
+        (function() {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+                var src = iframes[i].src || '';
+                // 先用 src 判断
+                if (src.indexOf('cloudflare') !== -1 ||
+                    src.indexOf('turnstile') !== -1 ||
+                    src.indexOf('challenges') !== -1) {
+                    return i;
+                }
+                // 再用内容判断
+                try {
+                    var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
+                    if (!doc || !doc.body) continue;
+                    var text = doc.body.innerText || '';
+                    var html = doc.body.innerHTML || '';
+                    if (text.indexOf('Verify') !== -1 ||
+                        text.indexOf('Verifying') !== -1 ||
+                        html.indexOf('cf-turnstile') !== -1 ||
+                        html.indexOf('turnstile') !== -1 ||
+                        doc.querySelector('[name="cf-turnstile-response"]')) {
+                        return i;
+                    }
+                } catch(e) {}
+            }
+            return -1;
+        })();
+    """)
+
+# ── 等待并点击 Turnstile ─────────────────────────────────────
+def handle_turnstile(sb, timeout_wait=25, timeout_token=90):
+    print("⏳ 等待 Turnstile 验证组件出现...")
     deadline = time.time() + timeout_wait
+    iframe_idx = -1
 
-    # 1. 等待 iframe 出现
-    iframe_el = None
     while time.time() < deadline:
-        try:
-            iframes = sb.find_elements("iframe")
-            for iframe in iframes:
-                src = iframe.get_attribute("src") or ""
-                if ("cloudflare" in src or "turnstile" in src or "challenges" in src):
-                    iframe_el = iframe
-                    break
-            if iframe_el:
-                print("✅ 验证组件就绪")
-                break
-        except Exception:
-            pass
-        time.sleep(1)
+        # 先清广告，每次循环都清
+        nuke_ads(sb)
 
-    if not iframe_el:
-        print("⚠️ 未找到 Turnstile iframe，尝试直接轮询 Token...")
-        return False
+        idx = find_turnstile_iframe_index(sb)
+        if idx >= 0:
+            iframe_idx = idx
+            print(f"✅ 验证组件就绪（iframe[{idx}]）")
+            break
 
-    # 2. 等待 Verifying 状态结束（最多30s）
-    print("⏳ 等待 Verifying 状态结束...")
-    verifying_deadline = time.time() + 30
-    while time.time() < verifying_deadline:
-        # 先检查 token 是否已经自动通过
+        # 同时检查是否已自动通过
         try:
             token = sb.execute_script("""
                 (function() {
@@ -183,27 +220,57 @@ def find_and_click_turnstile(sb, timeout_wait=20):
         except Exception:
             pass
 
-        # 检查是否还在 Verifying
-        still_verifying = sb.execute_script("""
-            (function() {
-                var iframes = document.querySelectorAll('iframe');
-                for (var i = 0; i < iframes.length; i++) {
-                    try {
-                        var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
-                        var text = doc.body ? doc.body.innerText : '';
-                        if (text.indexOf('Verifying') !== -1) return true;
-                    } catch(e) {}
-                }
-                return false;
-            })();
+        time.sleep(1)
+
+    if iframe_idx < 0:
+        print("ℹ️ 未检测到 Turnstile 验证组件")
+        return False
+
+    # 等 Verifying 状态结束（最多30s）
+    print("⏳ 等待 Verifying 状态结束...")
+    verifying_deadline = time.time() + 30
+    while time.time() < verifying_deadline:
+        # 检查是否已自动通过
+        try:
+            token = sb.execute_script("""
+                (function() {
+                    var el = document.querySelector('[name="cf-turnstile-response"]');
+                    return el ? el.value : '';
+                })();
+            """)
+            if token and len(token) > 20:
+                print(f"✅ Turnstile 已自动通过！token：{token[:60]}...")
+                return True
+        except Exception:
+            pass
+
+        still_verifying = sb.execute_script(f"""
+            (function() {{
+                try {{
+                    var iframe = document.querySelectorAll('iframe')[{iframe_idx}];
+                    var doc = iframe.contentDocument || iframe.contentWindow.document;
+                    var text = doc.body ? doc.body.innerText : '';
+                    return text.indexOf('Verifying') !== -1;
+                }} catch(e) {{ return false; }}
+            }})();
         """)
         if not still_verifying:
             print("✅ Verifying 状态已结束，准备点击")
             break
         time.sleep(1)
 
-    # 3. 滚动到 iframe 并点击
+    # 再清一次广告再点击
+    nuke_ads(sb)
+    sb.sleep(0.5)
+
+    # 找到 iframe 元素并点击
     try:
+        iframes = sb.find_elements("iframe")
+        if iframe_idx >= len(iframes):
+            print(f"⚠️ iframe 索引越界，尝试用第一个 iframe")
+            iframe_idx = 0
+        iframe_el = iframes[iframe_idx]
+
         sb.execute_script(
             "(function(el) { el.scrollIntoView({behavior: 'smooth', block: 'center'}); })(arguments[0]);",
             iframe_el
@@ -223,10 +290,12 @@ def find_and_click_turnstile(sb, timeout_wait=20):
             .move_by_offset(-rect["x"], -rect["y"]) \
             .perform()
         print("📐 坐标点击成功")
-        return True
     except Exception as e:
         print(f"⚠️ Turnstile 点击异常: {e}")
-        return False
+
+    # 等待 token
+    wait_for_turnstile_token(sb, timeout=timeout_token)
+    return True
 
 # ── 点击 LOGIN 按钮 ──────────────────────────────────────────
 def click_login_button(sb):
@@ -286,21 +355,10 @@ def browser_login(sb, email: str, password: str):
     sb.save_screenshot("before_submit.png")
 
     # 检查登录页是否有 Turnstile
-    has_turnstile = False
-    try:
-        iframes = sb.find_elements("iframe")
-        for iframe in iframes:
-            src = iframe.get_attribute("src") or ""
-            if "cloudflare" in src or "turnstile" in src or "challenges" in src:
-                has_turnstile = True
-                break
-    except Exception:
-        pass
-
-    if has_turnstile:
+    idx = find_turnstile_iframe_index(sb)
+    if idx >= 0:
         print("🛡️ 登录页检测到 Turnstile，等待验证...")
-        find_and_click_turnstile(sb, timeout_wait=30)
-        wait_for_turnstile_token(sb, timeout=90)
+        handle_turnstile(sb, timeout_wait=30, timeout_token=90)
 
     print("📤 提交登录请求...")
     click_login_button(sb)
@@ -334,7 +392,7 @@ def renew_server(sb, server_id: str) -> dict:
         print("⏳ 等待服务器页面加载...")
         sb.wait_for_element_present("body", timeout=20)
         sb.sleep(3)
-        close_ads(sb)
+        nuke_ads(sb)
         sb.sleep(1)
         print("✅ 服务器页面加载完成")
         sb.save_screenshot(f"loaded_{server_id}.png")
@@ -423,14 +481,8 @@ def renew_server(sb, server_id: str) -> dict:
         sb.sleep(2)
         sb.save_screenshot(f"after_click_renew_{server_id}.png")
 
-        # ── 找到并点击 Turnstile iframe，然后等待 token ──────
-        found = find_and_click_turnstile(sb, timeout_wait=20)
-        if found:
-            wait_for_turnstile_token(sb, timeout=90)
-            handled = True
-        else:
-            print("ℹ️ 未找到 Turnstile，续期可能直接完成")
-            handled = False
+        # ── 处理 Turnstile ───────────────────────────────────
+        handled = handle_turnstile(sb, timeout_wait=25, timeout_token=90)
 
         print("⏳ 等待续期完成...")
         sb.sleep(5)
