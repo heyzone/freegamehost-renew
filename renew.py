@@ -50,7 +50,7 @@ def parse_accounts():
         print(f"✅ 解析账号：{email}，服务器：{server_ids}")
     return accounts
 
-# ── 等待 Turnstile Token（续期页用）─────────────────────────
+# ── 等待 Turnstile Token ─────────────────────────────────────
 def wait_for_turnstile(sb, timeout=90):
     print("📡 开始监控 Turnstile Token...")
     print("⏳ 等待验证组件加载...")
@@ -162,7 +162,6 @@ def browser_login(sb, email: str, password: str):
 
     sb.save_screenshot("before_submit.png")
 
-    # 检查是否有 Turnstile（CF盾）
     has_turnstile = sb.execute_script(
         "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
     )
@@ -172,33 +171,78 @@ def browser_login(sb, email: str, password: str):
         print("📡 开始监控 Turnstile Token（登录页）...")
         click_turnstile(sb)
         wait_for_turnstile(sb, timeout=90)
-        print("📤 提交登录请求...")
-        click_login_button(sb)
-    else:
-        # 无 Turnstile，直接提交，让 reCAPTCHA 走隐式验证
-        print("📤 提交登录请求（无 Turnstile，直接提交）...")
-        click_login_button(sb)
+
+    print("📤 提交登录请求...")
+    click_login_button(sb)
 
     print("⏳ 等待登录跳转...")
     sb.sleep(8)
     sb.save_screenshot("after_login.png")
 
     current = sb.get_current_url()
-    print(f"🔁 登录后URL：{current}")
-
-    # 如果还在登录页，等多一轮再判断（reCAPTCHA 隐式延迟）
     if "login" in current.lower():
         print("⏳ 仍在登录页，再等 10s...")
         sb.sleep(10)
         sb.save_screenshot("after_login2.png")
         current = sb.get_current_url()
-        print(f"🔁 二次确认URL：{current}")
 
     if "login" in current.lower():
         sb.save_screenshot("login_failed.png")
         raise RuntimeError(f"❌ 登录失败，仍在登录页：{current}")
 
     print(f"✅ 登录成功！当前页面：{current}")
+
+# ── 读取服务器名称 ───────────────────────────────────────────
+def get_server_name(sb, server_id: str) -> str:
+    # 优先从侧边栏读取（截图可见左侧显示服务器名 kv1）
+    # 尝试多种 selector，取第一个非空且不包含特殊字符的结果
+    selectors = [
+        # 侧边栏服务器名（FGH 自定义面板）
+        ".server-name",
+        "[class*='serverName']",
+        "[class*='server-name']",
+        # 侧边栏卡片里的名字（通常在 ID 上方）
+        ".sidebar [class*='name']",
+        ".navigation [class*='name']",
+        # 通用标题
+        "h2", "h3",
+    ]
+    for sel in selectors:
+        try:
+            raw = sb.get_text(sel, timeout=3).strip()
+            # 过滤掉包含 /* 或者太短/太长的结果
+            if raw and 1 < len(raw) < 50 and "/*" not in raw and "/" not in raw:
+                name = raw.splitlines()[0].strip()
+                if name:
+                    return name
+        except Exception:
+            continue
+
+    # 最后备用：用 JS 从页面标题或 sidebar 读
+    try:
+        name = sb.execute_script("""
+            // 尝试找侧边栏服务器名
+            var els = document.querySelectorAll('*');
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                var text = el.innerText || '';
+                text = text.trim().split('\\n')[0].trim();
+                // 找到短文本且不是 ID 格式的
+                if (text.length > 1 && text.length < 40
+                    && !text.match(/^[0-9a-f-]{8,}$/i)
+                    && !text.includes('/')
+                    && el.children.length === 0) {
+                    return text;
+                }
+            }
+            return '';
+        """)
+        if name and 1 < len(name) < 50:
+            return name
+    except Exception:
+        pass
+
+    return server_id
 
 # ── 单服务器续期 ─────────────────────────────────────────────
 def renew_server(sb, server_id: str) -> dict:
@@ -212,37 +256,46 @@ def renew_server(sb, server_id: str) -> dict:
         sb.sleep(3)
         print("✅ 服务器页面加载完成")
 
+        # 截图看页面结构
+        sb.save_screenshot(f"before_renew_{server_id}.png")
+
+        # 读取服务器名称
         print("🔍 读取服务器名称...")
-        name = server_id
-        for sel in ["h1", ".server-name", "[class*='server-name']", "[class*='title']"]:
-            try:
-                raw = sb.get_text(sel, timeout=3).strip()
-                if raw:
-                    name = raw.splitlines()[0]
-                    break
-            except Exception:
-                continue
+        name = get_server_name(sb, server_id)
         result["name"] = name
         print(f"🖥 服务器名称：{name}")
 
+        # 打印页面所有按钮文字，方便调试
+        btns = sb.execute_script("""
+            var result = [];
+            document.querySelectorAll('button, a[role="button"]').forEach(function(el) {
+                var t = (el.innerText || el.textContent || '').trim();
+                if (t) result.push(t);
+            });
+            return result;
+        """)
+        print(f"🔍 页面按钮列表：{btns}")
+
         print("🔄 开始执行续期流程...")
-        sb.save_screenshot(f"before_renew_{server_id}.png")
 
-        print("📡 开始监控 Turnstile Token...")
-
+        # +8 HOURS 按钮（全大写，从截图确认）
         renew_btn_xpaths = [
+            # 精确匹配大写
+            "//button[contains(., '+8 HOURS')]",
             "//button[contains(., '+8 Hours')]",
-            "//a[contains(., '+8 Hours')]",
-            "//button[contains(., 'Renew')]",
-            "//a[contains(., 'Renew')]",
+            "//button[contains(., '+8 hours')]",
+            # 忽略大小写
+            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), '+8 HOURS')]",
+            # 包含 RENEW 的按钮
+            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'RENEW')]",
+            "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), '+8 HOURS')]",
             "//*[contains(@class,'renew')]",
-            "//*[contains(@id,'renew')]",
         ]
         clicked = False
         for xpath in renew_btn_xpaths:
             try:
                 sb.click(xpath, timeout=5, by="xpath")
-                print(f"🔄 +8 Hours 续期按钮已点击")
+                print(f"🔄 +8 HOURS 续期按钮已点击：{xpath}")
                 clicked = True
                 break
             except Exception:
@@ -253,16 +306,17 @@ def renew_server(sb, server_id: str) -> dict:
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
         print("⏳ 等待 Turnstile 验证组件...")
-        sb.sleep(2)
+        sb.sleep(3)
+        sb.save_screenshot(f"after_click_renew_{server_id}.png")
 
         has_turnstile = sb.execute_script(
             "return !!document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]');"
         )
         if has_turnstile:
             print("✅ 验证组件就绪")
-            print("📐 坐标计算完成")
             click_turnstile(sb)
             wait_for_turnstile(sb, timeout=90)
+            # 验证通过后可能需要点确认
             try:
                 sb.click(
                     "//button[@type='submit' or contains(., 'Confirm') or contains(., '确认')]",
@@ -275,17 +329,66 @@ def renew_server(sb, server_id: str) -> dict:
             print("ℹ️ 无需验证，续期直接完成")
 
         print("⏳ 等待续期完成...")
-        sb.sleep(3)
+        sb.sleep(5)
         sb.save_screenshot(f"after_renew_{server_id}.png")
 
+        # 读取剩余时间（从截图看格式是 HH:MM:SS，在 TIME REMAINING 下方）
         remaining = ""
-        for sel in ["[class*='remaining']", "[class*='time-left']", "[class*='expire']", ".remaining-time"]:
+        remaining_selectors = [
+            # FGH 自定义面板的时间显示
+            "[class*='remaining']",
+            "[class*='time-remaining']",
+            "[class*='timeRemaining']",
+            "[class*='time-left']",
+            "[class*='expire']",
+            ".remaining-time",
+            # 通用数字时间格式
+            "//*/text()[contains(., ':')]",
+        ]
+        for sel in remaining_selectors:
             try:
-                remaining = sb.get_text(sel, timeout=3).strip()
-                if remaining:
+                by = "xpath" if sel.startswith("//") else "css selector"
+                val = sb.get_text(sel, timeout=3, by=by).strip()
+                # 匹配 HH:MM:SS 格式
+                if val and ":" in val and len(val) <= 20:
+                    remaining = val
                     break
             except Exception:
                 continue
+
+        # 备用：JS 从页面找时间格式文字
+        if not remaining:
+            try:
+                remaining = sb.execute_script("""
+                    var els = document.querySelectorAll('*');
+                    for (var i = 0; i < els.length; i++) {
+                        var t = (els[i].innerText || '').trim();
+                        if (/^\\d{2}\\s*:\\s*\\d{2}\\s*:\\s*\\d{2}$/.test(t)) return t;
+                    }
+                    return '';
+                """)
+            except Exception:
+                pass
+
+        # 判断是否真正续期成功（时间不为 00:00:00）
+        if remaining and remaining.replace(":", "").replace(" ", "") == "000000":
+            print(f"⚠️ 剩余时间仍为 00:00:00，续期可能未生效，重试一次...")
+            sb.sleep(3)
+            sb.save_screenshot(f"retry_renew_{server_id}.png")
+            # 刷新页面确认
+            sb.refresh()
+            sb.sleep(3)
+            try:
+                remaining = sb.execute_script("""
+                    var els = document.querySelectorAll('*');
+                    for (var i = 0; i < els.length; i++) {
+                        var t = (els[i].innerText || '').trim();
+                        if (/^\\d{2}\\s*:\\s*\\d{2}\\s*:\\s*\\d{2}$/.test(t)) return t;
+                    }
+                    return '';
+                """)
+            except Exception:
+                pass
 
         result["success"]   = True
         result["remaining"] = remaining
