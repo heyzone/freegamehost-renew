@@ -69,34 +69,6 @@ def read_remaining_time(sb):
         pass
     return ""
 
-# ── 打印所有 iframe 详情（调试用）────────────────────────────
-def debug_iframes(sb, label=""):
-    try:
-        info = sb.execute_script("""
-            (function() {
-                var iframes = document.querySelectorAll('iframe');
-                var result = [];
-                for (var i = 0; i < iframes.length; i++) {
-                    var r = iframes[i].getBoundingClientRect();
-                    result.push({
-                        index: i,
-                        src: (iframes[i].src || '').substring(0, 80),
-                        x: Math.round(r.left),
-                        y: Math.round(r.top),
-                        w: Math.round(r.width),
-                        h: Math.round(r.height),
-                        visible: r.width > 0 && r.height > 0
-                    });
-                }
-                return result;
-            })();
-        """)
-        print(f"🔍 [{label}] 页面 iframe 列表（共{len(info)}个）：")
-        for f in info:
-            print(f"   iframe[{f['index']}] src={f['src']!r} pos=({f['x']},{f['y']}) size={f['w']}x{f['h']} visible={f['visible']}")
-    except Exception as e:
-        print(f"⚠️ debug_iframes 异常: {e}")
-
 # ── 等待 Turnstile Token ─────────────────────────────────────
 def wait_for_turnstile_token(sb, timeout=90):
     print("📡 开始监控 Turnstile Token...")
@@ -105,8 +77,19 @@ def wait_for_turnstile_token(sb, timeout=90):
         try:
             token = sb.execute_script("""
                 (function() {
+                    // 方式1: 普通 input
                     var el = document.querySelector('[name="cf-turnstile-response"]');
-                    return el ? el.value : '';
+                    if (el && el.value && el.value.length > 20) return el.value;
+                    // 方式2: Shadow DOM 穿透
+                    var widgets = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
+                    for (var i = 0; i < widgets.length; i++) {
+                        var shadow = widgets[i].shadowRoot;
+                        if (shadow) {
+                            var inp = shadow.querySelector('[name="cf-turnstile-response"]');
+                            if (inp && inp.value && inp.value.length > 20) return inp.value;
+                        }
+                    }
+                    return '';
                 })();
             """)
             if token and len(token) > 20:
@@ -114,68 +97,69 @@ def wait_for_turnstile_token(sb, timeout=90):
                 return token
         except Exception:
             pass
-        try:
-            count = sb.execute_script(
-                "(function() { return document.querySelectorAll('iframe').length; })();"
-            )
-            for i in range(count):
-                try:
-                    token = sb.execute_script(f"""
-                        (function() {{
-                            try {{
-                                var f = document.querySelectorAll('iframe')[{i}];
-                                var d = f.contentDocument || f.contentWindow.document;
-                                var e = d.querySelector('[name="cf-turnstile-response"]');
-                                return e ? e.value : '';
-                            }} catch(e) {{ return ''; }}
-                        }})();
-                    """)
-                    if token and len(token) > 20:
-                        print(f"✅ Cloudflare Turnstile 验证通过（iframe[{i}]）！token：{token[:60]}...")
-                        return token
-                except Exception:
-                    pass
-        except Exception:
-            pass
         time.sleep(1)
     raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
-# ── 强力清除广告 ─────────────────────────────────────────────
-def nuke_ads(sb):
-    try:
-        sb.execute_script("""
-            (function() {
-                document.querySelectorAll('*').forEach(function(el) {
-                    try {
-                        var style = window.getComputedStyle(el);
-                        var pos = style.position;
-                        var zi = parseInt(style.zIndex) || 0;
-                        if ((pos === 'fixed' || pos === 'absolute') && zi > 100) {
-                            var text = (el.innerText || '').toLowerCase();
-                            if (text.indexOf('verify') !== -1 ||
-                                text.indexOf('cloudflare') !== -1 ||
-                                text.indexOf('human') !== -1) return;
-                            el.style.display = 'none';
-                        }
-                    } catch(e) {}
-                });
-            })();
-        """)
-    except Exception:
-        pass
+# ── 找 Turnstile 容器坐标（Shadow DOM / cf-turnstile div）────
+def get_turnstile_coords(sb):
+    return sb.execute_script("""
+        (function() {
+            // 找所有可能是 Turnstile 的容器
+            var selectors = [
+                '.cf-turnstile',
+                '[data-sitekey]',
+                '[class*="turnstile"]',
+                '[id*="turnstile"]',
+                // 找包含 "Verify" 文字的小型容器
+            ];
+            for (var s = 0; s < selectors.length; s++) {
+                var els = document.querySelectorAll(selectors[s]);
+                for (var i = 0; i < els.length; i++) {
+                    var r = els[i].getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        return {x: r.left + 20, y: r.top + r.height / 2,
+                                w: r.width, h: r.height, sel: selectors[s]};
+                    }
+                }
+            }
+            // 最后手段：找页面中包含 "Verify you are human" 的元素
+            var all = document.querySelectorAll('*');
+            for (var i = 0; i < all.length; i++) {
+                var text = (all[i].childNodes.length <= 3 ? all[i].innerText || '' : '').trim();
+                if (text.indexOf('Verify') !== -1 && text.length < 50) {
+                    var r = all[i].getBoundingClientRect();
+                    if (r.width > 50 && r.height > 20) {
+                        return {x: r.left + 20, y: r.top + r.height / 2,
+                                w: r.width, h: r.height, sel: 'text:Verify'};
+                    }
+                }
+            }
+            return null;
+        })();
+    """)
 
-# ── 处理续期 Turnstile ───────────────────────────────────────
+# ── 处理续期 Turnstile（Shadow DOM 版）──────────────────────
 def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
     print("⏳ 等待 Turnstile 验证组件出现（最多40s）...")
     deadline = time.time() + timeout_wait
 
+    coords = None
     while time.time() < deadline:
         # 检查是否已自动通过
         try:
             token = sb.execute_script("""
                 (function() {
                     var el = document.querySelector('[name="cf-turnstile-response"]');
-                    return el ? el.value : '';
+                    if (el && el.value && el.value.length > 20) return el.value;
+                    var widgets = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
+                    for (var i = 0; i < widgets.length; i++) {
+                        var shadow = widgets[i].shadowRoot;
+                        if (shadow) {
+                            var inp = shadow.querySelector('[name="cf-turnstile-response"]');
+                            if (inp && inp.value && inp.value.length > 20) return inp.value;
+                        }
+                    }
+                    return '';
                 })();
             """)
             if token and len(token) > 20:
@@ -184,63 +168,96 @@ def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
         except Exception:
             pass
 
-        # 打印当前所有 iframe 信息（每5秒打印一次）
-        elapsed = timeout_wait - (deadline - time.time())
-        if int(elapsed) % 5 == 0:
-            debug_iframes(sb, f"等待中 {int(elapsed)}s")
+        # 找 Turnstile 容器
+        coords = get_turnstile_coords(sb)
+        if coords:
+            print(f"✅ 验证组件就绪：sel={coords['sel']} pos=({coords['x']:.0f},{coords['y']:.0f}) size={coords['w']:.0f}x{coords['h']:.0f}")
+            break
 
         time.sleep(1)
 
-    # 超时后打印最终 iframe 状态
-    print("⏰ 等待超时，打印最终 iframe 状态：")
-    debug_iframes(sb, "超时")
+    if not coords:
+        print("ℹ️ 未检测到 Turnstile 验证组件，跳过")
+        return False
 
-    # 最后尝试：不管什么 iframe，只要有就点
-    print("🔄 最后尝试：点击所有可见 iframe...")
-    try:
-        info = sb.execute_script("""
-            (function() {
-                var iframes = document.querySelectorAll('iframe');
-                var result = [];
-                for (var i = 0; i < iframes.length; i++) {
-                    var r = iframes[i].getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0 && r.top > 300) {
-                        result.push({index: i, x: r.left + 20, y: r.top + r.height/2});
-                    }
-                }
-                return result;
-            })();
-        """)
-        for f in info:
-            print(f"   点击 iframe[{f['index']}] at ({f['x']:.0f}, {f['y']:.0f})")
-            nuke_ads(sb)
-            sb.sleep(0.3)
-            from selenium.webdriver.common.action_chains import ActionChains
-            ActionChains(sb.driver) \
-                .move_by_offset(f["x"], f["y"]) \
-                .click() \
-                .move_by_offset(-f["x"], -f["y"]) \
-                .perform()
-            sb.sleep(1)
-            # 检查是否通过
+    # 等待 Verifying 状态结束（最多20s）
+    print("⏳ 等待 Verifying 状态结束...")
+    verifying_deadline = time.time() + 20
+    while time.time() < verifying_deadline:
+        # 检查是否已自动通过
+        try:
             token = sb.execute_script("""
                 (function() {
                     var el = document.querySelector('[name="cf-turnstile-response"]');
-                    return el ? el.value : '';
+                    if (el && el.value && el.value.length > 20) return el.value;
+                    return '';
                 })();
             """)
             if token and len(token) > 20:
-                print(f"✅ 点击后 Turnstile 通过！")
+                print(f"✅ Turnstile 已自动通过！")
                 return True
-    except Exception as e:
-        print(f"⚠️ 最后尝试点击异常: {e}")
+        except Exception:
+            pass
 
-    print("ℹ️ Turnstile 处理完毕，等待 token...")
-    try:
-        wait_for_turnstile_token(sb, timeout=30)
-        return True
-    except Exception:
-        return False
+        # 检查是否还在 Verifying（找包含 Verifying 文字的元素）
+        still_verifying = sb.execute_script("""
+            (function() {
+                var all = document.querySelectorAll('*');
+                for (var i = 0; i < all.length; i++) {
+                    var t = (all[i].innerText || '').trim();
+                    if (t === 'Verifying...' || t === 'Verifying') return true;
+                }
+                return false;
+            })();
+        """)
+        if not still_verifying:
+            print("✅ Verifying 状态已结束，准备点击")
+            break
+        time.sleep(1)
+
+    # 重新获取坐标（Verifying 结束后位置可能变化）
+    coords = get_turnstile_coords(sb)
+    if not coords:
+        print("⚠️ Verifying 后找不到组件，直接等待 token...")
+        try:
+            wait_for_turnstile_token(sb, timeout=30)
+            return True
+        except Exception:
+            return False
+
+    # 滚动到组件位置
+    sb.execute_script(f"window.scrollTo(0, Math.max(0, {coords['y']} - 300));")
+    sb.sleep(0.5)
+
+    # 重新获取滚动后坐标
+    coords = get_turnstile_coords(sb)
+    if coords:
+        print(f"📐 坐标计算完成：x={coords['x']:.0f}, y={coords['y']:.0f}")
+
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(sb.driver) \
+                .move_by_offset(coords["x"], coords["y"]) \
+                .click() \
+                .move_by_offset(-coords["x"], -coords["y"]) \
+                .perform()
+            print("📐 坐标点击成功")
+        except Exception as e:
+            print(f"⚠️ ActionChains 点击失败: {e}")
+            try:
+                sb.execute_script(f"""
+                    (function() {{
+                        var el = document.elementFromPoint({coords['x']}, {coords['y']});
+                        if (el) {{ el.click(); }}
+                    }})();
+                """)
+                print("📐 JS elementFromPoint 点击完成")
+            except Exception as e2:
+                print(f"⚠️ JS 点击也失败: {e2}")
+
+    # 等待 token
+    wait_for_turnstile_token(sb, timeout=timeout_token)
+    return True
 
 # ── 点击 LOGIN 按钮 ──────────────────────────────────────────
 def click_login_button(sb):
@@ -331,13 +348,7 @@ def renew_server(sb, server_id: str) -> dict:
         print("⏳ 等待服务器页面加载...")
         sb.wait_for_element_present("body", timeout=20)
         sb.sleep(3)
-        nuke_ads(sb)
-        sb.sleep(1)
         print("✅ 服务器页面加载完成")
-
-        # 打印初始 iframe 状态
-        debug_iframes(sb, "页面加载后")
-
         sb.save_screenshot(f"loaded_{server_id}.png")
 
         # ── 读取服务器名称 ───────────────────────────────────
@@ -419,15 +430,8 @@ def renew_server(sb, server_id: str) -> dict:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
             raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
 
-        # 点击后等2s再打印 iframe 状态
         sb.sleep(2)
-        debug_iframes(sb, "点击续期后2s")
         sb.save_screenshot(f"after_click_renew_{server_id}.png")
-
-        # 再等5s打印一次（Verifying 结束后）
-        sb.sleep(5)
-        debug_iframes(sb, "点击续期后7s")
-        sb.save_screenshot(f"after_click_renew2_{server_id}.png")
 
         # ── 处理 Turnstile ───────────────────────────────────
         handled = handle_turnstile(sb, timeout_wait=40, timeout_token=90)
