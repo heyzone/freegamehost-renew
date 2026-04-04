@@ -92,66 +92,33 @@ def wait_for_turnstile_token(sb, timeout=90):
         time.sleep(1)
     raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
-# ── 获取 Turnstile widget 坐标 ───────────────────────────────
-# 从 F12 确认：widget div 是 cf-turnstile-response input 的 level-1 父级
-# TurnstileBox class: RenewBox__TurnstileBox-sc-1inh2rq-18
-def get_turnstile_coords(sb):
+# ── 检查 Turnstile widget 是否存在 ──────────────────────────
+def turnstile_exists(sb):
     return sb.execute_script("""
         (function() {
-            // 方式1：直接找 TurnstileBox 容器（class 名前缀固定）
-            var selectors = [
-                '[class*="TurnstileBox"]',
-                '[class*="turnstile-box"]',
-                '[class*="turnstileBox"]',
-            ];
-            for (var s = 0; s < selectors.length; s++) {
-                var el = document.querySelector(selectors[s]);
-                if (el) {
-                    var r = el.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) {
-                        // widget 在 TurnstileBox 内部居中，点左侧约 1/3 处
-                        return {
-                            x: r.left + r.width * 0.25,
-                            y: r.top + r.height / 2,
-                            w: r.width,
-                            h: r.height,
-                            source: selectors[s]
-                        };
-                    }
-                }
-            }
+            return !!document.querySelector('[class*="TurnstileBox"]');
+        })();
+    """)
 
-            // 方式2：从 cf-turnstile-response input 向上找 level-1 父级（widget div）
-            var inp = document.querySelector('[name="cf-turnstile-response"]');
-            if (inp && inp.parentElement) {
-                var widgetDiv = inp.parentElement;
-                var r = widgetDiv.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) {
-                    return {
-                        x: r.left + 20,
-                        y: r.top + r.height / 2,
-                        w: r.width,
-                        h: r.height,
-                        source: 'input-parent'
-                    };
-                }
-
-                // level-2 父级
-                var grandParent = widgetDiv.parentElement;
-                if (grandParent) {
-                    var r2 = grandParent.getBoundingClientRect();
-                    if (r2.width > 0 && r2.height > 0) {
-                        return {
-                            x: r2.left + 20,
-                            y: r2.top + r2.height / 2,
-                            w: r2.width,
-                            h: r2.height,
-                            source: 'input-grandparent'
-                        };
-                    }
-                }
+# ── 检查是否还在 Verifying 状态 ─────────────────────────────
+# 通过检测 widget 内部是否包含 "Verifying" 文字节点
+def is_verifying(sb):
+    return sb.execute_script("""
+        (function() {
+            // 找 TurnstileBox 内所有文字节点
+            var box = document.querySelector('[class*="TurnstileBox"]');
+            if (!box) return false;
+            // 递归找文字
+            function getText(el) {
+                var text = '';
+                el.childNodes.forEach(function(node) {
+                    if (node.nodeType === 3) text += node.textContent;
+                    else if (node.nodeType === 1) text += getText(node);
+                });
+                return text;
             }
-            return null;
+            var text = getText(box);
+            return text.indexOf('Verifying') !== -1;
         })();
     """)
 
@@ -159,8 +126,9 @@ def get_turnstile_coords(sb):
 def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
     print("⏳ 等待 Turnstile widget 出现（最多40s）...")
     deadline = time.time() + timeout_wait
-    coords = None
 
+    # 1. 等待 TurnstileBox 出现
+    appeared = False
     while time.time() < deadline:
         # 先检查是否已有 token
         try:
@@ -179,22 +147,21 @@ def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
         except Exception:
             pass
 
-        coords = get_turnstile_coords(sb)
-        if coords:
-            print(f"✅ 验证组件就绪：source={coords['source']} pos=({coords['x']:.0f},{coords['y']:.0f}) size={coords['w']:.0f}x{coords['h']:.0f}")
+        if turnstile_exists(sb):
+            print("✅ 验证组件就绪")
+            appeared = True
             break
-
         time.sleep(1)
 
-    if not coords:
+    if not appeared:
         print("ℹ️ 未检测到 Turnstile widget，跳过")
         return False
 
-    # 等待 Verifying 状态结束（最多25s）
+    # 2. 等待 Verifying 状态结束（最多30s）
     print("⏳ 等待 Verifying 状态结束...")
-    verifying_deadline = time.time() + 25
+    verifying_deadline = time.time() + 30
     while time.time() < verifying_deadline:
-        # 检查 token
+        # 先检查 token
         try:
             token = sb.execute_script("""
                 (function() {
@@ -211,86 +178,84 @@ def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
         except Exception:
             pass
 
-        # 检查是否还在 Verifying（通过页面文字判断）
-        still_verifying = sb.execute_script("""
-            (function() {
-                var all = document.querySelectorAll('*');
-                for (var i = 0; i < all.length; i++) {
-                    var t = (all[i].innerText || '').trim();
-                    if (t === 'Verifying...' || t === 'Verifying') return true;
-                }
-                return false;
-            })();
-        """)
-        if not still_verifying:
+        if not is_verifying(sb):
             print("✅ Verifying 状态已结束，准备点击")
             break
-        time.sleep(1)
+        print("⏳ 仍在 Verifying...")
+        time.sleep(2)
     else:
         print("⚠️ Verifying 等待超时，强行点击")
 
-    # 重新获取坐标
-    coords = get_turnstile_coords(sb)
-    if not coords:
-        print("⚠️ 找不到 widget 坐标，直接等待 token...")
-        try:
-            wait_for_turnstile_token(sb, timeout=30)
-            return True
-        except Exception:
-            return False
+    sb.sleep(1)
 
-    # 滚动到 widget
-    sb.execute_script(f"window.scrollTo(0, Math.max(0, {coords['y']} - 300));")
-    sb.sleep(0.8)
+    # 3. 先滚动让 TurnstileBox 进入视口
+    sb.execute_script("""
+        (function() {
+            var box = document.querySelector('[class*="TurnstileBox"]');
+            if (box) box.scrollIntoView({behavior: 'smooth', block: 'center'});
+        })();
+    """)
+    sb.sleep(1)
 
-    # 重新获取滚动后坐标
-    coords = get_turnstile_coords(sb)
+    # 4. 获取当前视口内的实际坐标（scrollIntoView后重新获取）
+    coords = sb.execute_script("""
+        (function() {
+            var box = document.querySelector('[class*="TurnstileBox"]');
+            if (!box) return null;
+            var r = box.getBoundingClientRect();
+            // 找 input 父级 div（widget 实际位置）
+            var inp = document.querySelector('[name="cf-turnstile-response"]');
+            if (inp && inp.parentElement) {
+                var pr = inp.parentElement.getBoundingClientRect();
+                if (pr.width > 0 && pr.height > 0) {
+                    return {
+                        x: pr.left + 20,
+                        y: pr.top + pr.height / 2,
+                        w: pr.width,
+                        h: pr.height,
+                        source: 'widget-div'
+                    };
+                }
+            }
+            // 备用：TurnstileBox 左侧 1/4 处
+            return {
+                x: r.left + r.width * 0.15,
+                y: r.top + r.height / 2,
+                w: r.width,
+                h: r.height,
+                source: 'TurnstileBox'
+            };
+        })();
+    """)
+
     if not coords:
-        print("⚠️ 滚动后找不到 widget")
+        print("⚠️ 找不到坐标，跳过点击")
         return False
 
-    print(f"📐 坐标计算完成：x={coords['x']:.0f}, y={coords['y']:.0f}")
+    print(f"📐 坐标计算完成：x={coords['x']:.0f}, y={coords['y']:.0f} ({coords['source']})")
 
-    # 用 sb.click 直接点击元素（比 ActionChains 更稳定）
-    clicked = False
-    click_selectors = [
-        '[class*="TurnstileBox"]',
-        '[class*="turnstile-box"]',
-    ]
-    for sel in click_selectors:
-        try:
-            sb.click(sel, timeout=3)
-            print(f"📐 元素点击成功：{sel}")
-            clicked = True
-            break
-        except Exception:
-            pass
-
-    if not clicked:
-        # 备用：JS 直接点击
+    # 5. 用 ActionChains 点击视口内坐标
+    try:
+        from selenium.webdriver.common.action_chains import ActionChains
+        ac = ActionChains(sb.driver)
+        ac.move_by_offset(coords["x"], coords["y"]).click().perform()
+        # 重置鼠标位置
+        ac.move_by_offset(-coords["x"], -coords["y"]).perform()
+        print("📐 坐标点击成功")
+    except Exception as e:
+        print(f"⚠️ ActionChains 失败: {e}，尝试 JS 点击...")
         try:
             sb.execute_script(f"""
                 (function() {{
-                    var el = document.querySelector('[class*="TurnstileBox"]');
-                    if (el) {{
-                        el.click();
-                    }} else {{
-                        // 点击坐标位置的元素
-                        var target = document.elementFromPoint({coords['x']}, {coords['y']});
-                        if (target) target.click();
-                    }}
+                    var el = document.elementFromPoint({coords['x']}, {coords['y']});
+                    if (el) el.click();
                 }})();
             """)
             print("📐 JS 点击完成")
-            clicked = True
-        except Exception as e:
-            print(f"⚠️ JS 点击失败: {e}")
+        except Exception as e2:
+            print(f"⚠️ JS 点击也失败: {e2}")
 
-    if not clicked:
-        print("⚠️ 所有点击方式失败")
-        return False
-
-    # 等待 token
+    # 6. 等待 token
     wait_for_turnstile_token(sb, timeout=timeout_token)
     return True
 
@@ -442,6 +407,21 @@ def renew_server(sb, server_id: str) -> dict:
 
         print("🔄 开始执行续期流程...")
         print("📡 开始监控 Turnstile Token...")
+
+        # 先滚动到续期区域
+        sb.execute_script("""
+            (function() {
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    var t = (btns[i].innerText || '').toUpperCase();
+                    if (t.indexOf('+8') !== -1) {
+                        btns[i].scrollIntoView({behavior: 'smooth', block: 'center'});
+                        break;
+                    }
+                }
+            })();
+        """)
+        sb.sleep(1)
 
         # 点击 +8 HOURS 按钮
         renew_btn_xpaths = [
