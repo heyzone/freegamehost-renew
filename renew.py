@@ -1,6 +1,6 @@
 import os
 import time
-import subprocess
+import zipfile
 import requests
 from seleniumbase import SB
 
@@ -11,6 +11,27 @@ TG_BOT      = os.environ.get("TG_BOT", "")
 
 BASE_URL  = "https://panel.freegamehost.xyz"
 LOGIN_URL = f"{BASE_URL}/auth/login"
+NOPECHA_DIR = "/tmp/nopecha"
+
+# ── 下载并解压 NopeCHA 插件 ──────────────────────────────────
+def setup_nopecha():
+    if os.path.exists(os.path.join(NOPECHA_DIR, "manifest.json")):
+        print("✅ NopeCHA 插件已存在，跳过下载")
+        return NOPECHA_DIR
+
+    print("📥 下载 NopeCHA 插件...")
+    url = "https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip"
+    resp = requests.get(url, timeout=60)
+    zip_path = "/tmp/nopecha.zip"
+    with open(zip_path, "wb") as f:
+        f.write(resp.content)
+
+    os.makedirs(NOPECHA_DIR, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(NOPECHA_DIR)
+
+    print(f"✅ NopeCHA 插件解压完成：{NOPECHA_DIR}")
+    return NOPECHA_DIR
 
 # ── Telegram 推送 ────────────────────────────────────────────
 def tg_send(text: str):
@@ -70,65 +91,9 @@ def read_remaining_time(sb):
         pass
     return ""
 
-# ── xdotool 系统级点击（绕过所有 Selenium 限制）─────────────
-def xdotool_click(screen_x, screen_y):
-    try:
-        # 移动鼠标到目标位置并点击
-        subprocess.run(
-            ["xdotool", "mousemove", "--sync", str(int(screen_x)), str(int(screen_y))],
-            check=True, timeout=5
-        )
-        time.sleep(0.3)
-        subprocess.run(
-            ["xdotool", "click", "1"],
-            check=True, timeout=5
-        )
-        print(f"📐 xdotool 点击成功：({int(screen_x)}, {int(screen_y)})")
-        return True
-    except Exception as e:
-        print(f"⚠️ xdotool 点击失败: {e}")
-        return False
-
-# ── 获取浏览器窗口在屏幕上的位置偏移 ────────────────────────
-def get_browser_window_offset(sb):
-    try:
-        # 获取浏览器窗口位置
-        rect = sb.driver.get_window_rect()
-        win_x = rect.get("x", 0)
-        win_y = rect.get("y", 0)
-
-        # 获取浏览器内部 viewport 偏移（工具栏高度等）
-        offsets = sb.execute_script("""
-            (function() {
-                return {
-                    outerWidth: window.outerWidth,
-                    outerHeight: window.outerHeight,
-                    innerWidth: window.innerWidth,
-                    innerHeight: window.innerHeight,
-                    screenX: window.screenX,
-                    screenY: window.screenY
-                };
-            })();
-        """)
-
-        # Chrome 工具栏高度 = outerHeight - innerHeight
-        toolbar_height = offsets["outerHeight"] - offsets["innerHeight"]
-        # 左侧边栏宽度（通常为0）
-        sidebar_width = offsets["outerWidth"] - offsets["innerWidth"]
-
-        # 实际 viewport 在屏幕上的起始位置
-        viewport_x = offsets["screenX"] + sidebar_width
-        viewport_y = offsets["screenY"] + toolbar_height
-
-        print(f"🖥 浏览器窗口：pos=({win_x},{win_y}) viewport起点=({viewport_x},{viewport_y}) toolbar高={toolbar_height}")
-        return viewport_x, viewport_y
-    except Exception as e:
-        print(f"⚠️ 获取窗口偏移失败: {e}，使用默认值")
-        return 0, 100  # Chrome 默认工具栏约100px
-
 # ── 等待 Turnstile Token ─────────────────────────────────────
-def wait_for_turnstile_token(sb, timeout=90):
-    print("📡 开始监控 Turnstile Token...")
+def wait_for_turnstile_token(sb, timeout=120):
+    print("📡 等待 NopeCHA 自动解决 Turnstile（最长120s）...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -146,131 +111,11 @@ def wait_for_turnstile_token(sb, timeout=90):
                 return token
         except Exception:
             pass
+        remaining = int(deadline - time.time())
+        if remaining % 15 == 0 and remaining > 0:
+            print(f"⏳ 等待 NopeCHA 处理...（剩余 {remaining}s）")
         time.sleep(1)
-    raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
-
-# ── 检查 token ───────────────────────────────────────────────
-def check_token(sb):
-    try:
-        token = sb.execute_script("""
-            (function() {
-                var els = document.querySelectorAll('[name="cf-turnstile-response"]');
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].value && els[i].value.length > 20) return els[i].value;
-                }
-                return '';
-            })();
-        """)
-        return token if (token and len(token) > 20) else None
-    except Exception:
-        return None
-
-# ── 检查是否还在 Verifying ───────────────────────────────────
-def is_verifying(sb):
-    try:
-        return sb.execute_script("""
-            (function() {
-                var box = document.querySelector('[class*="TurnstileBox"]');
-                if (!box) return false;
-                return box.innerText.indexOf('Verifying') !== -1;
-            })();
-        """)
-    except Exception:
-        return False
-
-# ── 处理续期 Turnstile（xdotool 版）─────────────────────────
-def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
-    print("⏳ 等待 Turnstile widget 出现（最多40s）...")
-    deadline = time.time() + timeout_wait
-
-    # 1. 等待 TurnstileBox 出现
-    appeared = False
-    while time.time() < deadline:
-        token = check_token(sb)
-        if token:
-            print(f"✅ Turnstile 已自动通过！")
-            return True
-
-        exists = sb.execute_script("""
-            (function() { return !!document.querySelector('[class*="TurnstileBox"]'); })();
-        """)
-        if exists:
-            print("✅ 验证组件就绪")
-            appeared = True
-            break
-        time.sleep(1)
-
-    if not appeared:
-        print("ℹ️ 未检测到 Turnstile widget，跳过")
-        return False
-
-    # 2. 等待 Verifying 结束（最多30s）
-    print("⏳ 等待 Verifying 状态结束...")
-    verifying_deadline = time.time() + 30
-    while time.time() < verifying_deadline:
-        token = check_token(sb)
-        if token:
-            print(f"✅ Turnstile 已自动通过！")
-            return True
-        verifying = is_verifying(sb)
-        if verifying:
-            print("⏳ 仍在 Verifying...")
-        else:
-            print("✅ Verifying 结束，准备点击")
-            break
-        time.sleep(2)
-    else:
-        print("⚠️ Verifying 等待超时，强行点击")
-
-    sb.sleep(0.5)
-
-    # 3. 先把 TurnstileBox 滚入视口中心
-    sb.execute_script("""
-        (function() {
-            var box = document.querySelector('[class*="TurnstileBox"]');
-            if (box) box.scrollIntoView({behavior: 'instant', block: 'center'});
-        })();
-    """)
-    sb.sleep(1)
-
-    # 4. 获取 widget div（input 父级）在视口中的坐标
-    page_coords = sb.execute_script("""
-        (function() {
-            var inp = document.querySelector('[name="cf-turnstile-response"]');
-            if (!inp) return null;
-            var div = inp.parentElement;
-            if (!div) return null;
-            var r = div.getBoundingClientRect();
-            if (r.width > 0 && r.height > 0) {
-                return {x: r.left + 20, y: r.top + r.height / 2, w: r.width, h: r.height};
-            }
-            // 备用：TurnstileBox
-            var box = document.querySelector('[class*="TurnstileBox"]');
-            if (!box) return null;
-            var r2 = box.getBoundingClientRect();
-            return {x: r2.left + r2.width * 0.15, y: r2.top + r2.height / 2, w: r2.width, h: r2.height};
-        })();
-    """)
-
-    if not page_coords:
-        print("⚠️ 找不到 widget 坐标")
-        return False
-
-    print(f"📐 视口坐标：x={page_coords['x']:.0f}, y={page_coords['y']:.0f}")
-
-    # 5. 计算屏幕绝对坐标
-    viewport_x, viewport_y = get_browser_window_offset(sb)
-    screen_x = viewport_x + page_coords["x"]
-    screen_y = viewport_y + page_coords["y"]
-    print(f"📐 屏幕坐标：x={screen_x:.0f}, y={screen_y:.0f}")
-
-    # 6. xdotool 系统级点击
-    xdotool_click(screen_x, screen_y)
-    sb.sleep(1)
-
-    # 7. 等待 token
-    wait_for_turnstile_token(sb, timeout=timeout_token)
-    return True
+    raise TimeoutError("❌ Turnstile Token 等待超时（120s）")
 
 # ── 点击 LOGIN 按钮 ──────────────────────────────────────────
 def click_login_button(sb):
@@ -418,9 +263,8 @@ def renew_server(sb, server_id: str) -> dict:
         print(f"⏱ 续期前剩余时间：{time_before or '00:00:00'}")
 
         print("🔄 开始执行续期流程...")
-        print("📡 开始监控 Turnstile Token...")
 
-        # 先滚动到续期区域
+        # 滚动到续期区域
         sb.execute_script("""
             (function() {
                 var btns = document.querySelectorAll('button');
@@ -458,8 +302,9 @@ def renew_server(sb, server_id: str) -> dict:
         sb.sleep(2)
         sb.save_screenshot(f"after_click_renew_{server_id}.png")
 
-        # ── 处理 Turnstile ───────────────────────────────────
-        handled = handle_turnstile(sb, timeout_wait=40, timeout_token=90)
+        # ── 等待 NopeCHA 自动处理 Turnstile ─────────────────
+        # NopeCHA 会自动检测并解决，我们只需等待 token 出现
+        wait_for_turnstile_token(sb, timeout=120)
 
         print("⏳ 等待续期完成...")
         sb.sleep(5)
@@ -479,10 +324,6 @@ def renew_server(sb, server_id: str) -> dict:
             result["success"]   = True
             result["remaining"] = time_after
             print(f"🎉 续期成功！剩余时间：{time_after}")
-        elif handled:
-            result["success"]   = True
-            result["remaining"] = "（时间读取失败，但 Turnstile 已通过）"
-            print("⚠️ Turnstile 已通过，续期完成，但剩余时间读取为0，请手动确认")
         else:
             raise RuntimeError("续期后剩余时间仍为 00:00:00，续期可能未生效")
 
@@ -497,7 +338,7 @@ def renew_server(sb, server_id: str) -> dict:
     return result
 
 # ── 单账号主流程 ─────────────────────────────────────────────
-def process_account(account: dict):
+def process_account(account: dict, nopecha_dir: str):
     email      = account["email"]
     password   = account["password"]
     server_ids = account["server_ids"]
@@ -513,13 +354,20 @@ def process_account(account: dict):
     except Exception as e:
         print(f"⚠️ 出口IP验证失败: {e}，继续...")
 
-    sb_kwargs = dict(uc=True, headless=False)
+    # NopeCHA 插件需要 headless=False
+    sb_kwargs = dict(
+        uc=True,
+        headless=False,
+        extension_dir=nopecha_dir,
+    )
     if proxy_str:
         sb_kwargs["proxy"] = proxy_str
 
     results = []
     with SB(**sb_kwargs) as sb:
-        print("🔧 启动浏览器...")
+        print("🔧 启动浏览器（已加载 NopeCHA 插件）...")
+        # 等待插件初始化
+        sb.sleep(3)
         print("🚀 浏览器就绪！")
 
         browser_login(sb, email, password)
@@ -551,13 +399,16 @@ def main():
         print("❌ 未找到有效账号，请检查 FGH_ACCOUNT 环境变量")
         return
 
+    # 下载 NopeCHA 插件
+    nopecha_dir = setup_nopecha()
+
     all_results = []
     for acc in accounts:
         print(f"\n{'='*50}")
         print(f"👤 处理账号：{acc['email']}")
         print(f"{'='*50}")
         try:
-            results = process_account(acc)
+            results = process_account(acc, nopecha_dir)
             all_results.extend(results)
         except Exception as e:
             print(f"❌ 账号 {acc['email']} 处理失败: {e}")
