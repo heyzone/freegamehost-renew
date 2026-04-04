@@ -77,17 +77,9 @@ def wait_for_turnstile_token(sb, timeout=90):
         try:
             token = sb.execute_script("""
                 (function() {
-                    // 方式1: 普通 input
-                    var el = document.querySelector('[name="cf-turnstile-response"]');
-                    if (el && el.value && el.value.length > 20) return el.value;
-                    // 方式2: Shadow DOM 穿透
-                    var widgets = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-                    for (var i = 0; i < widgets.length; i++) {
-                        var shadow = widgets[i].shadowRoot;
-                        if (shadow) {
-                            var inp = shadow.querySelector('[name="cf-turnstile-response"]');
-                            if (inp && inp.value && inp.value.length > 20) return inp.value;
-                        }
+                    var els = document.querySelectorAll('[name="cf-turnstile-response"]');
+                    for (var i = 0; i < els.length; i++) {
+                        if (els[i].value && els[i].value.length > 20) return els[i].value;
                     }
                     return '';
                 })();
@@ -100,64 +92,62 @@ def wait_for_turnstile_token(sb, timeout=90):
         time.sleep(1)
     raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
-# ── 找 Turnstile 容器坐标（Shadow DOM / cf-turnstile div）────
-def get_turnstile_coords(sb):
+# ── 获取 Turnstile widget 容器坐标 ──────────────────────────
+# Turnstile response input 的父 div 就是 widget 渲染区域
+def get_turnstile_widget_coords(sb):
     return sb.execute_script("""
         (function() {
-            // 找所有可能是 Turnstile 的容器
-            var selectors = [
-                '.cf-turnstile',
-                '[data-sitekey]',
-                '[class*="turnstile"]',
-                '[id*="turnstile"]',
-                // 找包含 "Verify" 文字的小型容器
-            ];
-            for (var s = 0; s < selectors.length; s++) {
-                var els = document.querySelectorAll(selectors[s]);
-                for (var i = 0; i < els.length; i++) {
-                    var r = els[i].getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) {
-                        return {x: r.left + 20, y: r.top + r.height / 2,
-                                w: r.width, h: r.height, sel: selectors[s]};
-                    }
+            // 找 cf-turnstile-response input 的父容器
+            var inputs = document.querySelectorAll('[name="cf-turnstile-response"]');
+            for (var i = 0; i < inputs.length; i++) {
+                var parent = inputs[i].parentElement;
+                if (!parent) continue;
+                var r = parent.getBoundingClientRect();
+                // 父容器必须有实际尺寸
+                if (r.width > 0 && r.height > 0) {
+                    return {
+                        x: r.left + 20,
+                        y: r.top + r.height / 2,
+                        w: r.width,
+                        h: r.height,
+                        top: r.top
+                    };
                 }
-            }
-            // 最后手段：找页面中包含 "Verify you are human" 的元素
-            var all = document.querySelectorAll('*');
-            for (var i = 0; i < all.length; i++) {
-                var text = (all[i].childNodes.length <= 3 ? all[i].innerText || '' : '').trim();
-                if (text.indexOf('Verify') !== -1 && text.length < 50) {
-                    var r = all[i].getBoundingClientRect();
-                    if (r.width > 50 && r.height > 20) {
-                        return {x: r.left + 20, y: r.top + r.height / 2,
-                                w: r.width, h: r.height, sel: 'text:Verify'};
+                // 如果父容器没尺寸，向上找有尺寸的祖先
+                var p = parent.parentElement;
+                while (p && p !== document.body) {
+                    var pr = p.getBoundingClientRect();
+                    var ps = window.getComputedStyle(p);
+                    if (pr.width > 0 && pr.height > 0 && ps.display !== 'none') {
+                        return {
+                            x: pr.left + 20,
+                            y: pr.top + pr.height / 2,
+                            w: pr.width,
+                            h: pr.height,
+                            top: pr.top
+                        };
                     }
+                    p = p.parentElement;
                 }
             }
             return null;
         })();
     """)
 
-# ── 处理续期 Turnstile（Shadow DOM 版）──────────────────────
+# ── 处理续期 Turnstile ───────────────────────────────────────
 def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
-    print("⏳ 等待 Turnstile 验证组件出现（最多40s）...")
+    print("⏳ 等待 Turnstile widget 出现（最多40s）...")
     deadline = time.time() + timeout_wait
-
     coords = None
+
     while time.time() < deadline:
-        # 检查是否已自动通过
+        # 先检查是否已有 token
         try:
             token = sb.execute_script("""
                 (function() {
-                    var el = document.querySelector('[name="cf-turnstile-response"]');
-                    if (el && el.value && el.value.length > 20) return el.value;
-                    var widgets = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-                    for (var i = 0; i < widgets.length; i++) {
-                        var shadow = widgets[i].shadowRoot;
-                        if (shadow) {
-                            var inp = shadow.querySelector('[name="cf-turnstile-response"]');
-                            if (inp && inp.value && inp.value.length > 20) return inp.value;
-                        }
+                    var els = document.querySelectorAll('[name="cf-turnstile-response"]');
+                    for (var i = 0; i < els.length; i++) {
+                        if (els[i].value && els[i].value.length > 20) return els[i].value;
                     }
                     return '';
                 })();
@@ -168,28 +158,30 @@ def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
         except Exception:
             pass
 
-        # 找 Turnstile 容器
-        coords = get_turnstile_coords(sb)
+        # 找 widget 坐标
+        coords = get_turnstile_widget_coords(sb)
         if coords:
-            print(f"✅ 验证组件就绪：sel={coords['sel']} pos=({coords['x']:.0f},{coords['y']:.0f}) size={coords['w']:.0f}x{coords['h']:.0f}")
+            print(f"✅ 验证组件就绪：pos=({coords['x']:.0f},{coords['y']:.0f}) size={coords['w']:.0f}x{coords['h']:.0f}")
             break
 
         time.sleep(1)
 
     if not coords:
-        print("ℹ️ 未检测到 Turnstile 验证组件，跳过")
+        print("ℹ️ 未检测到 Turnstile widget，跳过")
         return False
 
-    # 等待 Verifying 状态结束（最多20s）
+    # 等待 Verifying 结束（Verifying 时 widget 高度通常更大）
     print("⏳ 等待 Verifying 状态结束...")
-    verifying_deadline = time.time() + 20
+    verifying_deadline = time.time() + 25
     while time.time() < verifying_deadline:
-        # 检查是否已自动通过
+        # 检查 token
         try:
             token = sb.execute_script("""
                 (function() {
-                    var el = document.querySelector('[name="cf-turnstile-response"]');
-                    if (el && el.value && el.value.length > 20) return el.value;
+                    var els = document.querySelectorAll('[name="cf-turnstile-response"]');
+                    for (var i = 0; i < els.length; i++) {
+                        if (els[i].value && els[i].value.length > 20) return els[i].value;
+                    }
                     return '';
                 })();
             """)
@@ -199,61 +191,58 @@ def handle_turnstile(sb, timeout_wait=40, timeout_token=90):
         except Exception:
             pass
 
-        # 检查是否还在 Verifying（找包含 Verifying 文字的元素）
-        still_verifying = sb.execute_script("""
-            (function() {
-                var all = document.querySelectorAll('*');
-                for (var i = 0; i < all.length; i++) {
-                    var t = (all[i].innerText || '').trim();
-                    if (t === 'Verifying...' || t === 'Verifying') return true;
-                }
-                return false;
-            })();
-        """)
-        if not still_verifying:
-            print("✅ Verifying 状态已结束，准备点击")
+        # 检查 widget 尺寸变化：Verifying 时高度约 100px，复选框时约 65px
+        new_coords = get_turnstile_widget_coords(sb)
+        if new_coords and new_coords["h"] < 90:
+            print(f"✅ Verifying 结束（高度={new_coords['h']:.0f}px），准备点击")
+            coords = new_coords
             break
-        time.sleep(1)
 
-    # 重新获取坐标（Verifying 结束后位置可能变化）
-    coords = get_turnstile_coords(sb)
+        time.sleep(1)
+    else:
+        # 超时也继续点击
+        new_coords = get_turnstile_widget_coords(sb)
+        if new_coords:
+            coords = new_coords
+        print(f"⚠️ Verifying 等待超时，强行点击（高度={coords['h']:.0f}px）")
+
+    # 滚动到 widget 位置
+    sb.execute_script(f"window.scrollTo(0, Math.max(0, {coords['top']} - 300));")
+    sb.sleep(0.8)
+
+    # 重新获取坐标（滚动后重新计算）
+    coords = get_turnstile_widget_coords(sb)
     if not coords:
-        print("⚠️ Verifying 后找不到组件，直接等待 token...")
+        print("⚠️ 滚动后找不到 widget，直接等待 token...")
         try:
             wait_for_turnstile_token(sb, timeout=30)
             return True
         except Exception:
             return False
 
-    # 滚动到组件位置
-    sb.execute_script(f"window.scrollTo(0, Math.max(0, {coords['y']} - 300));")
-    sb.sleep(0.5)
+    print(f"📐 坐标计算完成：x={coords['x']:.0f}, y={coords['y']:.0f}")
 
-    # 重新获取滚动后坐标
-    coords = get_turnstile_coords(sb)
-    if coords:
-        print(f"📐 坐标计算完成：x={coords['x']:.0f}, y={coords['y']:.0f}")
-
+    # ActionChains 点击
+    try:
+        from selenium.webdriver.common.action_chains import ActionChains
+        ActionChains(sb.driver) \
+            .move_by_offset(coords["x"], coords["y"]) \
+            .click() \
+            .move_by_offset(-coords["x"], -coords["y"]) \
+            .perform()
+        print("📐 坐标点击成功")
+    except Exception as e:
+        print(f"⚠️ ActionChains 点击失败: {e}，尝试 JS 点击...")
         try:
-            from selenium.webdriver.common.action_chains import ActionChains
-            ActionChains(sb.driver) \
-                .move_by_offset(coords["x"], coords["y"]) \
-                .click() \
-                .move_by_offset(-coords["x"], -coords["y"]) \
-                .perform()
-            print("📐 坐标点击成功")
-        except Exception as e:
-            print(f"⚠️ ActionChains 点击失败: {e}")
-            try:
-                sb.execute_script(f"""
-                    (function() {{
-                        var el = document.elementFromPoint({coords['x']}, {coords['y']});
-                        if (el) {{ el.click(); }}
-                    }})();
-                """)
-                print("📐 JS elementFromPoint 点击完成")
-            except Exception as e2:
-                print(f"⚠️ JS 点击也失败: {e2}")
+            sb.execute_script(f"""
+                (function() {{
+                    var el = document.elementFromPoint({coords['x']}, {coords['y']});
+                    if (el) el.click();
+                }})();
+            """)
+            print("📐 JS 点击完成")
+        except Exception as e2:
+            print(f"⚠️ JS 点击也失败: {e2}")
 
     # 等待 token
     wait_for_turnstile_token(sb, timeout=timeout_token)
