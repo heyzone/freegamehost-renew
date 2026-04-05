@@ -2,7 +2,7 @@ name: FGH-Renew
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 0,8,16 * * *'
+    - cron: '30 1,9,17 * * *'
 jobs:
   run_fgh_renew:
     runs-on: ubuntu-latest
