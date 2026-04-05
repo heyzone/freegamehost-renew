@@ -2,7 +2,7 @@ name: FGH-Renew
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 23 * *'
+    - cron: '0 */23 * * *'
 jobs:
   run_fgh_renew:
     runs-on: ubuntu-latest
@@ -53,8 +53,11 @@ jobs:
           FGH_ACCOUNT: ${{ secrets.FGH_ACCOUNT }}
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
           TG_BOT: ${{ secrets.TG_BOT }}
+          DISPLAY: ":99"
         run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          python renew.py
 
       - name: 📸 上传截图
         if: always()
