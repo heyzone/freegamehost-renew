@@ -10,6 +10,11 @@ jobs:
       - name: 📥 检出仓库
         uses: actions/checkout@v4
 
+      - name: 拉取私库脚本
+        run: |
+          git clone https://x-access-token:${{ secrets.PRIVATE_REPO_PAT }}@github.com/heyzone/freegamehost-auto.git private_repo
+          cp private_repo/renew.py renew.py
+      
       - name: 🐍 设置 Python
         uses: actions/setup-python@v5
         with:
