@@ -2,7 +2,7 @@ name: FGH-Renew
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0,8 * * *'
+    - cron: '0 */6 * * *'
 jobs:
   run_fgh_renew:
     runs-on: ubuntu-latest
@@ -20,10 +20,7 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: 🛡️ 启动 GOST 代理转发
-        env:
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}
-        if: ${{ env.GOST_PROXY != '' }}
+      - name: 🛠️ 下载 GOST（供 Python 按需启动多节点）
         run: |
           VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest \
             | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
@@ -31,11 +28,7 @@ jobs:
           wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
           tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
           chmod +x gost
-          nohup ./gost -L http://:8080 -F "$GOST_PROXY" > gost.log 2>&1 &
-          sleep 3
-          IP=$(curl -s -x http://127.0.0.1:8080 https://api.ipify.org)
-          IP_MASKED=$(echo "$IP" | sed 's/\([0-9]*\.[0-9]*\.[0-9]*\.\)[0-9]*/\1xx/')
-          echo "✅ GOST 已启动，出口IP确认：$IP_MASKED"
+          echo "✅ GOST 下载完成"
 
       - name: 🛠️ 安装系统依赖
         run: |
