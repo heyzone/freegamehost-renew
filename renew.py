@@ -1,6 +1,6 @@
 import os
 import time
-import zipfile
+import random
 import requests
 from seleniumbase import SB
 
@@ -11,27 +11,6 @@ TG_BOT      = os.environ.get("TG_BOT", "")
 
 BASE_URL  = "https://panel.freegamehost.xyz"
 LOGIN_URL = f"{BASE_URL}/auth/login"
-NOPECHA_DIR = "/tmp/nopecha"
-
-# ── 下载并解压 NopeCHA 插件 ──────────────────────────────────
-def setup_nopecha():
-    if os.path.exists(os.path.join(NOPECHA_DIR, "manifest.json")):
-        print("✅ NopeCHA 插件已存在，跳过下载")
-        return NOPECHA_DIR
-
-    print("📥 下载 NopeCHA 插件...")
-    url = "https://github.com/NopeCHALLC/nopecha-extension/releases/latest/download/chromium.zip"
-    resp = requests.get(url, timeout=60)
-    zip_path = "/tmp/nopecha.zip"
-    with open(zip_path, "wb") as f:
-        f.write(resp.content)
-
-    os.makedirs(NOPECHA_DIR, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(NOPECHA_DIR)
-
-    print(f"✅ NopeCHA 插件解压完成：{NOPECHA_DIR}")
-    return NOPECHA_DIR
 
 # ── Telegram 推送 ────────────────────────────────────────────
 def tg_send(text: str):
@@ -91,9 +70,33 @@ def read_remaining_time(sb):
         pass
     return ""
 
+# ── 真人模拟输入 ─────────────────────────────────────────────
+def human_type(sb, selector, text):
+    sb.click(selector)
+    sb.sleep(random.uniform(0.3, 0.6))
+    for ch in text:
+        sb.execute_script(f"""
+            (function() {{
+                var el = document.querySelector('{selector}');
+                if (el) el.focus();
+            }})();
+        """)
+        sb.execute_script(f"""
+            (function() {{
+                var el = document.querySelector('{selector}');
+                if (!el) return;
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, el.value + '{ch.replace("'", "\\'")}');
+                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }})();
+        """)
+        sb.sleep(random.uniform(0.05, 0.15))
+
 # ── 等待 Turnstile Token ─────────────────────────────────────
-def wait_for_turnstile_token(sb, timeout=120):
-    print("📡 等待 NopeCHA 自动解决 Turnstile（最长120s）...")
+def wait_for_turnstile_token(sb, timeout=90):
+    print("📡 开始监控 Turnstile Token...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -111,47 +114,21 @@ def wait_for_turnstile_token(sb, timeout=120):
                 return token
         except Exception:
             pass
-        remaining = int(deadline - time.time())
-        if remaining % 15 == 0 and remaining > 0:
-            print(f"⏳ 等待 NopeCHA 处理...（剩余 {remaining}s）")
         time.sleep(1)
-    raise TimeoutError("❌ Turnstile Token 等待超时（120s）")
+    raise TimeoutError(f"❌ Turnstile Token 等待超时（{timeout}s）")
 
-# ── 点击 LOGIN 按钮 ──────────────────────────────────────────
-def click_login_button(sb):
-    try:
-        sb.click("//button[normalize-space(.)='LOGIN']", timeout=8, by="xpath")
-        return
-    except Exception:
-        pass
-    try:
-        sb.click("//button[contains(.,'LOGIN') and not(contains(.,'Reload'))]",
-                 timeout=5, by="xpath")
-        return
-    except Exception:
-        pass
-    try:
-        sb.click("button[type='submit']:last-of-type", timeout=5)
-        return
-    except Exception:
-        pass
-    sb.execute_script("""
-        (function() {
-            var btns = document.querySelectorAll('button[type="submit"]');
-            if (btns.length > 0) btns[btns.length - 1].click();
-        })();
-    """)
-
-# ── 浏览器登录 ───────────────────────────────────────────────
-def browser_login(sb, email: str, password: str):
+# ── 单次登录尝试 ─────────────────────────────────────────────
+def try_login(sb, email: str, password: str) -> bool:
     print("🔑 打开登录页面...")
     sb.open(LOGIN_URL)
-    sb.sleep(5)
+    sb.sleep(random.uniform(3, 5))
     sb.save_screenshot("login_page.png")
 
-    print("✏️ 填写账号密码...")
+    print("✏️ 填写账号密码（真人模拟输入）...")
     try:
         sb.wait_for_element_present("input", timeout=15)
+
+        # 用 JS nativeInputValueSetter 填入（React 框架需要）
         email_js    = email.replace("\\", "\\\\").replace("'", "\\'")
         password_js = password.replace("\\", "\\\\").replace("'", "\\'")
         sb.execute_script(f"""
@@ -162,38 +139,93 @@ def browser_login(sb, email: str, password: str):
                 ).set;
                 setter.call(inputs[0], '{email_js}');
                 inputs[0].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                inputs[0].dispatchEvent(new Event('change', {{ bubbles: true }}));
                 setter.call(inputs[1], '{password_js}');
                 inputs[1].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                inputs[1].dispatchEvent(new Event('change', {{ bubbles: true }}));
             }})();
         """)
-        sb.sleep(0.5)
+        sb.sleep(random.uniform(0.8, 1.5))
         print("✅ 账号密码填写完成")
     except Exception as e:
         sb.save_screenshot("input_error.png")
-        raise RuntimeError(f"填写表单失败: {e}")
+        print(f"❌ 填写表单失败: {e}")
+        return False
 
-    sb.save_screenshot("before_submit.png")
+    sb.save_screenshot("before_captcha.png")
+
+    # 等待验证组件加载
+    print("⏳ 等待验证组件加载...")
+    for _ in range(10):
+        try:
+            iframes = sb.find_elements("iframe")
+            recaptcha = sb.execute_script("""
+                (function() {
+                    return !!document.getElementById('g-recaptcha-response') ||
+                           !!document.querySelector('.g-recaptcha') ||
+                           !!document.querySelector('iframe[src*="recaptcha"]');
+                })();
+            """)
+            if iframes or recaptcha:
+                print(f"✅ 检测到验证组件（iframes={len(iframes)}, recaptcha={recaptcha}）")
+                break
+        except Exception:
+            pass
+        sb.sleep(1)
+
+    sb.sleep(2)
+
+    # 用 uc_gui_handle_captcha 处理验证（Falix 方案）
+    print("🛡️ 调用 uc_gui_handle_captcha 处理验证...")
+    try:
+        sb.uc_gui_handle_captcha()
+        print("✅ uc_gui_handle_captcha 完成")
+    except Exception as e:
+        print(f"⚠️ uc_gui_handle_captcha 异常: {e}")
+
+    sb.sleep(random.uniform(2, 4))
+    sb.save_screenshot("after_captcha.png")
+
+    # 点击登录按钮
     print("📤 提交登录请求...")
-    click_login_button(sb)
+    try:
+        sb.click("//button[normalize-space(.)='LOGIN']", timeout=8, by="xpath")
+    except Exception:
+        try:
+            sb.click("//button[contains(.,'LOGIN') and not(contains(.,'Reload'))]",
+                     timeout=5, by="xpath")
+        except Exception:
+            try:
+                sb.click("button[type='submit']:last-of-type", timeout=5)
+            except Exception:
+                sb.execute_script("""
+                    (function() {
+                        var btns = document.querySelectorAll('button[type="submit"]');
+                        if (btns.length > 0) btns[btns.length - 1].click();
+                    })();
+                """)
 
-    print("⏳ 等待登录跳转...")
-    sb.sleep(10)
+    sb.sleep(random.uniform(6, 9))
     sb.save_screenshot("after_login.png")
 
     current = sb.get_current_url()
     print(f"🔁 登录后URL：{current}")
+    return "login" not in current.lower()
 
-    if "login" in current.lower():
-        print("⏳ 仍在登录页，再等 10s...")
-        sb.sleep(10)
-        sb.save_screenshot("after_login2.png")
-        current = sb.get_current_url()
+# ── 浏览器登录（最多重试3次，参考Falix方案）────────────────
+def browser_login(sb, email: str, password: str):
+    for attempt in range(1, 4):
+        print(f"\n🔐 登录尝试 {attempt}/3...")
+        if try_login(sb, email, password):
+            print(f"✅ 登录成功！当前页面：{sb.get_current_url()}")
+            return
+        else:
+            sb.save_screenshot(f"login_failed_{attempt}.png")
+            print(f"❌ 第 {attempt} 次登录失败")
+            if attempt < 3:
+                sb.sleep(random.uniform(3, 6))
 
-    if "login" in current.lower():
-        sb.save_screenshot("login_failed.png")
-        raise RuntimeError(f"❌ 登录失败，仍在登录页：{current}")
-
-    print(f"✅ 登录成功！当前页面：{current}")
+    raise RuntimeError("❌ 3次登录均失败")
 
 # ── 单服务器续期 ─────────────────────────────────────────────
 def renew_server(sb, server_id: str) -> dict:
@@ -204,7 +236,7 @@ def renew_server(sb, server_id: str) -> dict:
         sb.open(server_url)
         print("⏳ 等待服务器页面加载...")
         sb.wait_for_element_present("body", timeout=20)
-        sb.sleep(3)
+        sb.sleep(random.uniform(3, 5))
         print("✅ 服务器页面加载完成")
         sb.save_screenshot(f"loaded_{server_id}.png")
 
@@ -264,7 +296,7 @@ def renew_server(sb, server_id: str) -> dict:
 
         print("🔄 开始执行续期流程...")
 
-        # 滚动到续期区域
+        # 滚动到续期按钮
         sb.execute_script("""
             (function() {
                 var btns = document.querySelectorAll('button');
@@ -276,7 +308,7 @@ def renew_server(sb, server_id: str) -> dict:
                 }
             })();
         """)
-        sb.sleep(1)
+        sb.sleep(random.uniform(0.8, 1.5))
 
         # 点击 +8 HOURS 按钮
         renew_btn_xpaths = [
@@ -302,12 +334,98 @@ def renew_server(sb, server_id: str) -> dict:
         sb.sleep(2)
         sb.save_screenshot(f"after_click_renew_{server_id}.png")
 
-        # ── 等待 NopeCHA 自动处理 Turnstile ─────────────────
-        # NopeCHA 会自动检测并解决，我们只需等待 token 出现
-        wait_for_turnstile_token(sb, timeout=120)
+        # ── 处理续期 Turnstile ───────────────────────────────
+        print("⏳ 等待 Turnstile 验证组件出现...")
+
+        # 等待 TurnstileBox 出现（最多20s）
+        turnstile_appeared = False
+        for _ in range(20):
+            try:
+                token = sb.execute_script("""
+                    (function() {
+                        var els = document.querySelectorAll('[name="cf-turnstile-response"]');
+                        for (var i = 0; i < els.length; i++) {
+                            if (els[i].value && els[i].value.length > 20) return els[i].value;
+                        }
+                        return '';
+                    })();
+                """)
+                if token and len(token) > 20:
+                    print(f"✅ Turnstile 已自动通过！token：{token[:60]}...")
+                    turnstile_appeared = True
+                    break
+            except Exception:
+                pass
+
+            exists = sb.execute_script("""
+                (function() {
+                    return !!document.querySelector('[class*="TurnstileBox"]') ||
+                           !!document.querySelector('[name="cf-turnstile-response"]');
+                })();
+            """)
+            if exists:
+                print("✅ 验证组件就绪")
+                turnstile_appeared = True
+                break
+            time.sleep(1)
+
+        if turnstile_appeared:
+            # 等待 Verifying 结束
+            print("⏳ 等待 Verifying 状态结束...")
+            for _ in range(25):
+                # 先检查 token
+                try:
+                    token = sb.execute_script("""
+                        (function() {
+                            var els = document.querySelectorAll('[name="cf-turnstile-response"]');
+                            for (var i = 0; i < els.length; i++) {
+                                if (els[i].value && els[i].value.length > 20) return els[i].value;
+                            }
+                            return '';
+                        })();
+                    """)
+                    if token and len(token) > 20:
+                        print(f"✅ Turnstile 已自动通过！")
+                        break
+                except Exception:
+                    pass
+
+                verifying = sb.execute_script("""
+                    (function() {
+                        var box = document.querySelector('[class*="TurnstileBox"]');
+                        if (!box) return false;
+                        return box.innerText.indexOf('Verifying') !== -1;
+                    })();
+                """)
+                if not verifying:
+                    print("✅ Verifying 结束，尝试点击复选框...")
+                    break
+                print("⏳ 仍在 Verifying...")
+                time.sleep(2)
+
+            sb.sleep(1)
+
+            # 用 uc_gui_click_captcha 点击 Turnstile 复选框
+            print("🖱️ 调用 uc_gui_click_captcha 点击 Turnstile...")
+            try:
+                sb.uc_gui_click_captcha()
+                print("✅ uc_gui_click_captcha 完成")
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_captcha 异常: {e}")
+                # 备用：uc_gui_handle_captcha
+                try:
+                    sb.uc_gui_handle_captcha()
+                    print("✅ uc_gui_handle_captcha 备用完成")
+                except Exception as e2:
+                    print(f"⚠️ 备用也失败: {e2}")
+
+            # 等待 token
+            wait_for_turnstile_token(sb, timeout=90)
+        else:
+            print("ℹ️ 未检测到 Turnstile，续期可能直接完成")
 
         print("⏳ 等待续期完成...")
-        sb.sleep(5)
+        sb.sleep(random.uniform(4, 6))
         sb.save_screenshot(f"after_renew_{server_id}.png")
 
         time_after = read_remaining_time(sb)
@@ -338,7 +456,7 @@ def renew_server(sb, server_id: str) -> dict:
     return result
 
 # ── 单账号主流程 ─────────────────────────────────────────────
-def process_account(account: dict, nopecha_dir: str):
+def process_account(account: dict):
     email      = account["email"]
     password   = account["password"]
     server_ids = account["server_ids"]
@@ -354,20 +472,14 @@ def process_account(account: dict, nopecha_dir: str):
     except Exception as e:
         print(f"⚠️ 出口IP验证失败: {e}，继续...")
 
-    # NopeCHA 插件需要 headless=False
-    sb_kwargs = dict(
-        uc=True,
-        headless=False,
-        extension_dir=nopecha_dir,
-    )
+    # 参考 Falix 方案：uc=True, xvfb=True
+    sb_kwargs = dict(uc=True, xvfb=True)
     if proxy_str:
         sb_kwargs["proxy"] = proxy_str
 
     results = []
     with SB(**sb_kwargs) as sb:
-        print("🔧 启动浏览器（已加载 NopeCHA 插件）...")
-        # 等待插件初始化
-        sb.sleep(3)
+        print("🔧 启动浏览器...")
         print("🚀 浏览器就绪！")
 
         browser_login(sb, email, password)
@@ -375,7 +487,7 @@ def process_account(account: dict, nopecha_dir: str):
         for sid in server_ids:
             r = renew_server(sb, sid)
             results.append(r)
-            sb.sleep(2)
+            sb.sleep(random.uniform(2, 4))
 
     return results
 
@@ -399,16 +511,13 @@ def main():
         print("❌ 未找到有效账号，请检查 FGH_ACCOUNT 环境变量")
         return
 
-    # 下载 NopeCHA 插件
-    nopecha_dir = setup_nopecha()
-
     all_results = []
     for acc in accounts:
         print(f"\n{'='*50}")
         print(f"👤 处理账号：{acc['email']}")
         print(f"{'='*50}")
         try:
-            results = process_account(acc, nopecha_dir)
+            results = process_account(acc)
             all_results.extend(results)
         except Exception as e:
             print(f"❌ 账号 {acc['email']} 处理失败: {e}")
