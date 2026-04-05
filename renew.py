@@ -70,30 +70,6 @@ def read_remaining_time(sb):
         pass
     return ""
 
-# ── 真人模拟输入 ─────────────────────────────────────────────
-def human_type(sb, selector, text):
-    sb.click(selector)
-    sb.sleep(random.uniform(0.3, 0.6))
-    for ch in text:
-        sb.execute_script(f"""
-            (function() {{
-                var el = document.querySelector('{selector}');
-                if (el) el.focus();
-            }})();
-        """)
-        sb.execute_script(f"""
-            (function() {{
-                var el = document.querySelector('{selector}');
-                if (!el) return;
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, el.value + '{ch.replace("'", "\\'")}');
-                el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                el.dispatchEvent(new Event('change', {{bubbles: true}}));
-            }})();
-        """)
-        sb.sleep(random.uniform(0.05, 0.15))
-
 # ── 等待 Turnstile Token ─────────────────────────────────────
 def wait_for_turnstile_token(sb, timeout=90):
     print("📡 开始监控 Turnstile Token...")
@@ -121,14 +97,13 @@ def wait_for_turnstile_token(sb, timeout=90):
 def try_login(sb, email: str, password: str) -> bool:
     print("🔑 打开登录页面...")
     sb.open(LOGIN_URL)
-    sb.sleep(random.uniform(3, 5))
+    # 多等几秒让 reCAPTCHA v3 隐式完成
+    sb.sleep(random.uniform(5, 8))
     sb.save_screenshot("login_page.png")
 
-    print("✏️ 填写账号密码（真人模拟输入）...")
+    print("✏️ 填写账号密码...")
     try:
         sb.wait_for_element_present("input", timeout=15)
-
-        # 用 JS nativeInputValueSetter 填入（React 框架需要）
         email_js    = email.replace("\\", "\\\\").replace("'", "\\'")
         password_js = password.replace("\\", "\\\\").replace("'", "\\'")
         sb.execute_script(f"""
@@ -145,48 +120,18 @@ def try_login(sb, email: str, password: str) -> bool:
                 inputs[1].dispatchEvent(new Event('change', {{ bubbles: true }}));
             }})();
         """)
-        sb.sleep(random.uniform(0.8, 1.5))
+        # 模拟人工停留
+        sb.sleep(random.uniform(1.5, 3))
         print("✅ 账号密码填写完成")
     except Exception as e:
         sb.save_screenshot("input_error.png")
         print(f"❌ 填写表单失败: {e}")
         return False
 
-    sb.save_screenshot("before_captcha.png")
+    sb.save_screenshot("before_submit.png")
 
-    # 等待验证组件加载
-    print("⏳ 等待验证组件加载...")
-    for _ in range(10):
-        try:
-            iframes = sb.find_elements("iframe")
-            recaptcha = sb.execute_script("""
-                (function() {
-                    return !!document.getElementById('g-recaptcha-response') ||
-                           !!document.querySelector('.g-recaptcha') ||
-                           !!document.querySelector('iframe[src*="recaptcha"]');
-                })();
-            """)
-            if iframes or recaptcha:
-                print(f"✅ 检测到验证组件（iframes={len(iframes)}, recaptcha={recaptcha}）")
-                break
-        except Exception:
-            pass
-        sb.sleep(1)
-
-    sb.sleep(2)
-
-    # 用 uc_gui_handle_captcha 处理验证（Falix 方案）
-    print("🛡️ 调用 uc_gui_handle_captcha 处理验证...")
-    try:
-        sb.uc_gui_handle_captcha()
-        print("✅ uc_gui_handle_captcha 完成")
-    except Exception as e:
-        print(f"⚠️ uc_gui_handle_captcha 异常: {e}")
-
-    sb.sleep(random.uniform(2, 4))
-    sb.save_screenshot("after_captcha.png")
-
-    # 点击登录按钮
+    # 直接提交，依赖 reCAPTCHA v3 隐式验证
+    # 不调用 uc_gui_handle_captcha，避免触发图片验证
     print("📤 提交登录请求...")
     try:
         sb.click("//button[normalize-space(.)='LOGIN']", timeout=8, by="xpath")
@@ -205,14 +150,35 @@ def try_login(sb, email: str, password: str) -> bool:
                     })();
                 """)
 
-    sb.sleep(random.uniform(6, 9))
+    # 等待跳转
+    sb.sleep(random.uniform(8, 12))
     sb.save_screenshot("after_login.png")
 
     current = sb.get_current_url()
     print(f"🔁 登录后URL：{current}")
-    return "login" not in current.lower()
 
-# ── 浏览器登录（最多重试3次，参考Falix方案）────────────────
+    if "login" in current.lower():
+        # 检查是否有图片验证弹出
+        has_captcha_img = sb.execute_script("""
+            (function() {
+                return !!document.querySelector('iframe[src*="recaptcha/api2/bframe"]') ||
+                       !!document.querySelector('.rc-imageselect');
+            })();
+        """)
+        if has_captcha_img:
+            print("🖼️ 检测到 reCAPTCHA 图片验证，尝试 uc_gui_handle_captcha...")
+            try:
+                sb.uc_gui_handle_captcha()
+                print("✅ uc_gui_handle_captcha 完成")
+                sb.sleep(5)
+                current = sb.get_current_url()
+                print(f"🔁 验证后URL：{current}")
+            except Exception as e:
+                print(f"⚠️ uc_gui_handle_captcha 异常: {e}")
+
+    return "login" not in sb.get_current_url().lower()
+
+# ── 浏览器登录（最多重试3次）────────────────────────────────
 def browser_login(sb, email: str, password: str):
     for attempt in range(1, 4):
         print(f"\n🔐 登录尝试 {attempt}/3...")
@@ -223,7 +189,7 @@ def browser_login(sb, email: str, password: str):
             sb.save_screenshot(f"login_failed_{attempt}.png")
             print(f"❌ 第 {attempt} 次登录失败")
             if attempt < 3:
-                sb.sleep(random.uniform(3, 6))
+                sb.sleep(random.uniform(4, 8))
 
     raise RuntimeError("❌ 3次登录均失败")
 
@@ -329,17 +295,16 @@ def renew_server(sb, server_id: str) -> dict:
 
         if not clicked:
             sb.save_screenshot(f"no_renew_btn_{server_id}.png")
-            raise RuntimeError("找不到续期按钮，请检查截图确认页面结构")
+            raise RuntimeError("找不到续期按钮")
 
         sb.sleep(2)
         sb.save_screenshot(f"after_click_renew_{server_id}.png")
 
         # ── 处理续期 Turnstile ───────────────────────────────
-        print("⏳ 等待 Turnstile 验证组件出现...")
-
-        # 等待 TurnstileBox 出现（最多20s）
-        turnstile_appeared = False
+        print("⏳ 等待 Turnstile 验证组件出现（最多20s）...")
+        turnstile_found = False
         for _ in range(20):
+            # 先检查 token 是否已有
             try:
                 token = sb.execute_script("""
                     (function() {
@@ -351,8 +316,8 @@ def renew_server(sb, server_id: str) -> dict:
                     })();
                 """)
                 if token and len(token) > 20:
-                    print(f"✅ Turnstile 已自动通过！token：{token[:60]}...")
-                    turnstile_appeared = True
+                    print(f"✅ Turnstile 已自动通过！")
+                    turnstile_found = True
                     break
             except Exception:
                 pass
@@ -365,15 +330,14 @@ def renew_server(sb, server_id: str) -> dict:
             """)
             if exists:
                 print("✅ 验证组件就绪")
-                turnstile_appeared = True
+                turnstile_found = True
                 break
             time.sleep(1)
 
-        if turnstile_appeared:
-            # 等待 Verifying 结束
+        if turnstile_found:
+            # 等待 Verifying 结束（最多25s）
             print("⏳ 等待 Verifying 状态结束...")
-            for _ in range(25):
-                # 先检查 token
+            for i in range(25):
                 try:
                     token = sb.execute_script("""
                         (function() {
@@ -398,21 +362,22 @@ def renew_server(sb, server_id: str) -> dict:
                     })();
                 """)
                 if not verifying:
-                    print("✅ Verifying 结束，尝试点击复选框...")
+                    print("✅ Verifying 结束，准备点击复选框...")
                     break
-                print("⏳ 仍在 Verifying...")
+                if i % 4 == 0:
+                    print(f"⏳ 仍在 Verifying... ({i*2}s)")
                 time.sleep(2)
 
             sb.sleep(1)
+            sb.save_screenshot(f"before_captcha_click_{server_id}.png")
 
             # 用 uc_gui_click_captcha 点击 Turnstile 复选框
-            print("🖱️ 调用 uc_gui_click_captcha 点击 Turnstile...")
+            print("🖱️ 调用 uc_gui_click_captcha 点击 Turnstile 复选框...")
             try:
                 sb.uc_gui_click_captcha()
                 print("✅ uc_gui_click_captcha 完成")
             except Exception as e:
                 print(f"⚠️ uc_gui_click_captcha 异常: {e}")
-                # 备用：uc_gui_handle_captcha
                 try:
                     sb.uc_gui_handle_captcha()
                     print("✅ uc_gui_handle_captcha 备用完成")
@@ -472,7 +437,6 @@ def process_account(account: dict):
     except Exception as e:
         print(f"⚠️ 出口IP验证失败: {e}，继续...")
 
-    # 参考 Falix 方案：uc=True, xvfb=True
     sb_kwargs = dict(uc=True, xvfb=True)
     if proxy_str:
         sb_kwargs["proxy"] = proxy_str
